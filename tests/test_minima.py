@@ -12,7 +12,13 @@ from ase import Atoms
 from ase.calculators.calculator import Calculator, all_changes
 
 from fairchem_mcp import domain
-from fairchem_mcp.deflation import DeflatedCalculator, rmsd, same_minimum
+from fairchem_mcp.deflation import (
+    DeflatedCalculator,
+    fingerprint,
+    fingerprints_match,
+    rmsd,
+    same_minimum,
+)
 from fairchem_mcp.jobs import JobManager
 from fairchem_mcp.session import Session
 
@@ -106,6 +112,67 @@ def test_deflation_kernel_also_finds_both():
     job = session.get_job(res["job_id"])
     assert wait_for(lambda: not job.is_active(), timeout=60)
     assert job.result["n_found"] == 2
+
+
+def test_fingerprint_is_rotation_translation_permutation_invariant():
+    from ase.cluster import Icosahedron
+
+    a = Icosahedron("Cu", noshells=2)
+    f0 = fingerprint(a)
+
+    rotated = a.copy()
+    rotated.rotate(37, "z", center="COP")
+    rotated.translate([1.5, -2.0, 0.7])
+    assert fingerprints_match(f0, fingerprint(rotated), tol=1e-6)
+
+    permuted = a.copy()
+    order = list(range(len(a)))[::-1]
+    permuted = permuted[order]
+    assert fingerprints_match(f0, fingerprint(permuted), tol=1e-6)
+
+
+def test_fingerprint_comparator_collapses_rotated_duplicates():
+    """A free Cu13 cluster: flooding produces rotated copies of one isomer; the
+    fingerprint comparator must dedup them where raw RMSD does not."""
+    from ase.calculators.emt import EMT
+    from ase.cluster import Icosahedron
+
+    session = Session()
+    sid = session.add_structure(Icosahedron("Cu", noshells=2))
+    cid = session.add_calculator(EMT())
+
+    res = domain.start_minima_search(
+        session, sid, cid, n_minima=6, kernel="flooding",
+        comparator="fingerprint", sigma=0.5, amplitude=0.8,
+        fmax=0.02, steps=400, energy_tol=0.02, rmsd_tol=0.1, escape_rattle=0.3,
+    )
+    job = session.get_job(res["job_id"])
+    assert wait_for(lambda: not job.is_active(), timeout=120)
+    # Rotated copies of a single isomer must not be counted as distinct minima.
+    energies = [m["energy"] for m in job.result["minima"]]
+    spread = max(energies) - min(energies) if energies else 0.0
+    assert job.result["n_found"] <= 2, energies
+    assert spread <= 0.02, energies
+
+
+def test_basinhopping_finds_both_wells():
+    session = Session()
+    sid = session.add_structure(_double_well_atom())
+    cid = session.add_calculator(DoubleWell())
+
+    res = domain.start_minima_search(
+        session, sid, cid, n_minima=2, kernel="basinhopping",
+        bh_step=1.2, bh_temperature=1.0, optimizer="FIRE", fmax=0.01, steps=200,
+        energy_tol=0.05, rmsd_tol=0.2, patience=20, seed=1,
+    )
+    job = session.get_job(res["job_id"])
+    assert wait_for(lambda: not job.is_active(), timeout=60)
+    assert job.result["n_found"] == 2
+    xs = sorted(
+        round(session.get_structure(m["structure_id"]).get_positions()[0, 0], 2)
+        for m in job.result["minima"]
+    )
+    assert xs == [-1.0, 1.0]
 
 
 def test_minima_search_abort():

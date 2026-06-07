@@ -586,27 +586,37 @@ def _finalize_minima(job: Job, status: str, found: list[dict]) -> None:
 
 
 def _run_minima(job: Job) -> None:
-    """Find multiple distinct relaxed geometries by deflation / flooding.
+    """Find multiple distinct relaxed geometries.
 
-    Each attempt relaxes from the same starting point on a PES biased to repel
-    the minima found so far (skipped on the first attempt, which relaxes the
-    plain structure), then polishes on the true PES and keeps the result if it is
-    a new minimum. Stops at ``n_minima`` found, after ``patience`` fruitless
-    attempts in a row, or after ``max_attempts`` total. Steerable: ``abort`` and
-    ``pause`` act between/within attempts; ``set_fmax`` / ``switch_optimizer``
-    apply to the current relaxation.
+    Three methods (``kernel``):
+
+    * ``"flooding"`` / ``"deflation"`` — relax from the starting point on a PES
+      biased to repel the minima found so far (a ``DeflatedCalculator``), then
+      polish on the true PES. Best when a fixed frame is enforced (adsorbate on a
+      frozen slab, anchored conformer): a spatial bump cannot be evaded.
+    * ``"basinhopping"`` — random-kick the current structure, relax on the true
+      PES, accept by the Metropolis criterion (Wales & Doye). The right tool for
+      *free* clusters, whose rigid-body rotation defeats a Cartesian bias.
+
+    Novelty is judged by an energy gate plus a structural ``comparator``:
+    ``"rmsd"`` (raw-coordinate RMSD; cheap, frame-dependent) or ``"fingerprint"``
+    (sorted pairwise distances; rotation/translation/permutation invariant — use
+    for free clusters/molecules). Stops at ``n_minima`` found, after ``patience``
+    fruitless attempts, or after ``max_attempts``. Steerable: ``abort`` / ``pause``
+    act between/within attempts; ``set_fmax`` / ``switch_optimizer`` on the
+    current relaxation.
     """
-    from .deflation import DeflatedCalculator, same_minimum
+    from .deflation import DeflatedCalculator, fingerprint, fingerprints_match, rmsd
 
     cfg = job.config
     base = job.base_calc
     template = job.template
     session = job.session
 
+    method = cfg.get("kernel", "flooding")
     n_minima = int(cfg.get("n_minima", 5))
     patience = int(cfg.get("patience", 6))
     max_attempts = int(cfg.get("max_attempts", 6 * n_minima))
-    kernel = cfg.get("kernel", "flooding")
     bias_kw = {
         "sigma": float(cfg.get("sigma", 0.4)),
         "amplitude": float(cfg.get("amplitude", 1.0)),
@@ -614,8 +624,12 @@ def _run_minima(job: Job) -> None:
         "power": float(cfg.get("power", 2)),
     }
     energy_tol = float(cfg.get("energy_tol", 0.02))
-    rmsd_tol = float(cfg.get("rmsd_tol", 0.1))
+    struct_tol = float(cfg.get("rmsd_tol", 0.1))  # Å; RMSD or per-distance tol
+    comparator = cfg.get("comparator", "rmsd")
     escape_rattle = float(cfg.get("escape_rattle", 0.1))
+    bh_step = float(cfg.get("bh_step", 0.4))
+    bh_temperature = float(cfg.get("bh_temperature", 0.8))
+    seed = int(cfg.get("seed", 0))
     optimizer_name = cfg.get("optimizer", "FIRE")
     fmax = float(cfg.get("fmax", 0.05))
     max_steps = int(cfg.get("steps", 300))
@@ -623,7 +637,6 @@ def _run_minima(job: Job) -> None:
 
     centers: list[np.ndarray] = []
     found: list[dict] = []
-    stagnant = 0
 
     with job._lock:
         job.status = "running"
@@ -662,6 +675,76 @@ def _run_minima(job: Job) -> None:
             if not restart:
                 return "finished"
 
+    def _is_novel(energy: float, work: Any) -> bool:
+        positions = work.get_positions()
+        fp = fingerprint(work) if comparator == "fingerprint" else None
+        for r in found:
+            if abs(energy - r["energy"]) > energy_tol:
+                continue
+            if comparator == "fingerprint":
+                if fingerprints_match(fp, r["fingerprint"], struct_tol):
+                    return False
+            elif rmsd(positions, r["positions"]) <= struct_tol:
+                return False
+        return True
+
+    def _commit(work: Any, energy: float) -> None:
+        positions = work.get_positions()
+        max_force = float(np.linalg.norm(work.get_forces(), axis=1).max())
+        sid = session.add_structure(work.copy()) if session is not None else None
+        found.append({
+            "energy": energy,
+            "positions": positions,
+            "fingerprint": fingerprint(work),
+            "max_force": max_force,
+            "structure_id": sid,
+        })
+        centers.append(positions.ravel().copy())
+        job.record_fields(
+            energy=energy, max_force=max_force, n_found=len(found),
+            target=n_minima, phase=f"found#{len(found)}",
+        )
+
+    # -- basin-hopping ----------------------------------------------------
+    if method == "basinhopping":
+        rng = np.random.default_rng(seed)
+        cur = template.copy()
+        cur.calc = base
+        if _relax(cur, "relax#0") == "aborted":
+            _finalize_minima(job, "aborted", found)
+            return
+        e_cur = float(cur.get_potential_energy())
+        if _is_novel(e_cur, cur):
+            _commit(cur, e_cur)
+        stagnant = 0
+        for attempt in range(1, max_attempts):
+            if len(found) >= n_minima:
+                break
+            trial = cur.copy()
+            trial.calc = base
+            _perturb_free(trial, bh_step, seed=seed + attempt)
+            if _relax(trial, f"hop#{attempt}") == "aborted":
+                _finalize_minima(job, "aborted", found)
+                return
+            e_new = float(trial.get_potential_energy())
+            if _is_novel(e_new, trial):
+                _commit(trial, e_new)
+                stagnant = 0
+            else:
+                stagnant += 1
+            # Metropolis acceptance moves the walker (exploration), independent
+            # of whether the basin was new.
+            if e_new <= e_cur or rng.random() < np.exp(
+                -(e_new - e_cur) / max(bh_temperature, 1e-9)
+            ):
+                cur, e_cur = trial, e_new
+            if stagnant >= patience:
+                break
+        _finalize_minima(job, "converged" if found else "finished", found)
+        return
+
+    # -- flooding / deflation --------------------------------------------
+    stagnant = 0
     for attempt in range(max_attempts):
         work = template.copy()  # always start from x0
         if centers:
@@ -669,7 +752,7 @@ def _run_minima(job: Job) -> None:
             # zero-gradient peak), relax on the biased PES, then polish on the
             # true one.
             _perturb_free(work, escape_rattle, seed=attempt)
-            work.calc = DeflatedCalculator(base, centers, kernel=kernel, **bias_kw)
+            work.calc = DeflatedCalculator(base, centers, kernel=method, **bias_kw)
             if _relax(work, f"escape#{attempt}") == "aborted":
                 _finalize_minima(job, "aborted", found)
                 return
@@ -683,31 +766,9 @@ def _run_minima(job: Job) -> None:
             return
 
         energy = float(work.get_potential_energy())
-        positions = work.get_positions()
-        is_new = all(
-            not same_minimum(
-                energy, positions, r["energy"], r["positions"], energy_tol, rmsd_tol
-            )
-            for r in found
-        )
-        if is_new:
-            atoms_found = work.copy()
-            sid = session.add_structure(atoms_found) if session is not None else None
-            max_force = float(np.linalg.norm(work.get_forces(), axis=1).max())
-            found.append(
-                {
-                    "energy": energy,
-                    "positions": positions,
-                    "max_force": max_force,
-                    "structure_id": sid,
-                }
-            )
-            centers.append(positions.ravel().copy())
+        if _is_novel(energy, work):
+            _commit(work, energy)
             stagnant = 0
-            job.record_fields(
-                energy=energy, max_force=max_force, n_found=len(found),
-                target=n_minima, phase=f"found#{len(found)}",
-            )
             if len(found) >= n_minima:
                 break
         else:

@@ -203,11 +203,14 @@ def start_minima_search(
     calculator_id: str,
     n_minima: int = 5,
     kernel: str = "flooding",
+    comparator: str = "rmsd",
     optimizer: str = "FIRE",
     fmax: float = 0.05,
     steps: int = 300,
     sigma: float = 0.4,
     amplitude: float = 1.0,
+    bh_step: float = 0.4,
+    bh_temperature: float = 0.8,
     energy_tol: float = 0.02,
     rmsd_tol: float = 0.1,
     patience: int = 6,
@@ -215,20 +218,28 @@ def start_minima_search(
 ) -> dict:
     """Search for multiple distinct relaxed geometries (local minima of the PES).
 
-    Repeatedly relaxes from the starting structure on a PES biased to repel the
-    minima found so far, then polishes on the true PES. kernel is 'flooding'
-    (Gaussian bumps; sigma in Å, amplitude in eV) or 'deflation' (inverse-distance
-    poles). New minima are deduped by energy_tol (eV) + rmsd_tol (Å) and each is
-    registered as a new structure. Poll get_status for n_found/target; get_results
-    returns the distinct minima (structure_id + energy), sorted by energy.
-    Steerable via steer abort/pause (and set_fmax/switch_optimizer mid-relaxation).
+    kernel selects the method:
+      - 'flooding' (Gaussian bumps; sigma Å, amplitude eV) / 'deflation'
+        (inverse-distance poles): relax on a biased PES then polish. Best when a
+        fixed frame is enforced (adsorbate on a frozen slab, anchored conformer).
+      - 'basinhopping' (random kick bh_step Å + relax + Metropolis at bh_temperature
+        eV): best for FREE clusters, whose rotation defeats a spatial bias.
+    comparator judges novelty alongside energy_tol (eV): 'rmsd' (raw coords) or
+    'fingerprint' (rotation/translation/permutation invariant — use for free
+    clusters/molecules). rmsd_tol (Å) is the structural tolerance for both.
+
+    Each new minimum is registered as a structure. Poll get_status for n_found/
+    target; get_results returns the distinct minima (structure_id + energy) sorted
+    by energy. Steerable via steer abort/pause (and set_fmax/switch_optimizer).
     """
     try:
         return domain.start_minima_search(
             SESSION, structure_id, calculator_id,
-            n_minima=n_minima, kernel=kernel, optimizer=optimizer, fmax=fmax,
-            steps=steps, sigma=sigma, amplitude=amplitude, energy_tol=energy_tol,
-            rmsd_tol=rmsd_tol, patience=patience, step_delay=step_delay,
+            n_minima=n_minima, kernel=kernel, comparator=comparator,
+            optimizer=optimizer, fmax=fmax, steps=steps, sigma=sigma,
+            amplitude=amplitude, bh_step=bh_step, bh_temperature=bh_temperature,
+            energy_tol=energy_tol, rmsd_tol=rmsd_tol, patience=patience,
+            step_delay=step_delay,
         )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)

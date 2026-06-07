@@ -273,19 +273,31 @@ def start_minima_search(
     power: float = 2.0,
     energy_tol: float = 0.02,
     rmsd_tol: float = 0.1,
+    comparator: str = "rmsd",
     escape_rattle: float = 0.1,
+    bh_step: float = 0.4,
+    bh_temperature: float = 0.8,
+    seed: int = 0,
     patience: int = 6,
     max_attempts: int | None = None,
     step_delay: float = 0.0,
 ) -> dict:
     """Search for multiple distinct relaxed geometries (local minima of the PES).
 
-    Each attempt relaxes from the same starting geometry on a PES *biased* to
-    repel the minima already found (``kernel``: 'flooding' Gaussian bumps, or
-    'deflation' inverse-distance poles), then polishes on the true PES. New
-    minima are deduplicated by energy (``energy_tol`` eV) + RMSD (``rmsd_tol`` Å)
-    and registered as structures. Steerable like a relaxation via abort/pause
-    (and set_fmax/switch_optimizer on the current relaxation).
+    ``kernel`` selects the search:
+
+    * 'flooding' / 'deflation' — relax on a PES biased to repel the minima found
+      so far (Gaussian bumps / inverse-distance poles), then polish on the true
+      PES. Best for fixed-frame problems (adsorbate on a frozen slab, anchored
+      conformer).
+    * 'basinhopping' — random-kick + relax + Metropolis accept. Best for *free*
+      clusters, whose rigid-body rotation defeats a spatial bias.
+
+    Novelty is judged by energy (``energy_tol`` eV) plus ``comparator``: 'rmsd'
+    (raw coords; frame-dependent) or 'fingerprint' (sorted pairwise distances;
+    rotation/translation/permutation invariant — use for free clusters/molecules).
+    Each new minimum is registered as a structure. Steerable via abort/pause (and
+    set_fmax/switch_optimizer on the current relaxation).
     """
     template = session.get_structure(structure_id).copy()
     template.calc = None
@@ -303,7 +315,11 @@ def start_minima_search(
         "power": power,
         "energy_tol": energy_tol,
         "rmsd_tol": rmsd_tol,
+        "comparator": comparator,
         "escape_rattle": escape_rattle,
+        "bh_step": bh_step,
+        "bh_temperature": bh_temperature,
+        "seed": seed,
         "patience": patience,
         "max_attempts": max_attempts if max_attempts is not None else 6 * n_minima,
         "step_delay": step_delay,

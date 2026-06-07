@@ -43,6 +43,12 @@ get_results("job_1")
 - `energy_tol` (eV) + `rmsd_tol` (Å) — two geometries are "the same site" only if
   **both** their energies and their RMSD are within tolerance.
 
+> **Free clusters / nanoparticles instead of a frozen slab?** The frozen slab here
+> pins the frame, so the default `kernel="flooding"` + `comparator="rmsd"` works.
+> A *free* cluster can rotate to dodge a spatial bump and rotated copies look
+> distinct under raw RMSD — so use `kernel="basinhopping"` with
+> `comparator="fingerprint"` (rotation/translation/permutation-invariant) there.
+
 **Runnable version:** [`02_adsorption_sites.py`](02_adsorption_sites.py)
 
 ```

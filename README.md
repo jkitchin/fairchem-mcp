@@ -88,9 +88,18 @@ repeatedly from the starting structure on a PES **biased to repel the minima
 already found**, then polishes each escape on the true PES:
 
 - `kernel="flooding"` (default) adds Gaussian bumps (`sigma` Å, `amplitude` eV);
-  `kernel="deflation"` adds inverse-distance poles (`eta`, `power`).
-- New minima are deduplicated by energy (`energy_tol`) + RMSD (`rmsd_tol`) and
-  each is registered as its own structure.
+  `kernel="deflation"` adds inverse-distance poles (`eta`, `power`). Both are best
+  for **fixed-frame** problems (an adsorbate on a frozen slab, an anchored
+  conformer).
+- `kernel="basinhopping"` (random kick + relax + Metropolis accept) is the right
+  tool for **free clusters / nanoparticles**, whose rigid-body rotation defeats a
+  spatial bias. Pair it with `comparator="fingerprint"` (see below).
+- New minima are deduplicated by energy (`energy_tol`) plus a structure
+  `comparator`: `"rmsd"` (raw coords, frame-dependent — fine for a fixed frame) or
+  `"fingerprint"` (sorted pairwise distances; rotation/translation/permutation
+  invariant — use for free clusters and molecules, or rotated copies get
+  miscounted as distinct). Each accepted minimum is registered as its own
+  structure.
 
 This reuses the *escape mechanism* from POUNCE's `find_minima` (deflation /
 flooding) but drives it with ASE's gradient optimizers — the right inner solver

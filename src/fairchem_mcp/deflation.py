@@ -130,6 +130,31 @@ def same_minimum(e1, pos1, e2, pos2, energy_tol, rmsd_tol):
     return rmsd(pos1, pos2) <= rmsd_tol
 
 
+def fingerprint(atoms):
+    """A rotation/translation/permutation-invariant structure descriptor.
+
+    The sorted vector of all pairwise interatomic distances (minimum-image for
+    periodic cells). Two geometries that differ only by a rigid move or an atom
+    relabeling have (nearly) identical fingerprints — unlike a raw-coordinate
+    RMSD, which a free cluster defeats simply by rotating. Use this comparator
+    for free clusters and molecules; the cheaper raw RMSD is fine when a fixed
+    frame is enforced (e.g. an adsorbate on a frozen slab).
+    """
+    mic = bool(getattr(atoms, "pbc", None) is not None and any(atoms.pbc))
+    d = atoms.get_all_distances(mic=mic)
+    iu = np.triu_indices(len(atoms), k=1)
+    return np.sort(d[iu])
+
+
+def fingerprints_match(f1, f2, tol):
+    """True if two fingerprints agree to within ``tol`` (Å) on every distance."""
+    a = np.asarray(f1, dtype=float)
+    b = np.asarray(f2, dtype=float)
+    if a.shape != b.shape:
+        return False
+    return float(np.abs(a - b).max()) <= tol
+
+
 def rmsd(pos1, pos2):
     """Root-mean-square deviation between two flattenable position arrays (Å).
 
