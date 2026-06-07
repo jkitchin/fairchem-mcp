@@ -28,12 +28,54 @@ optimizer when it stalls, tighten `fmax`, change temperature, pause, or abort.
 ## Install
 
 ```bash
-pip install -e .            # core: mcp + ase + jedi (works with EMT)
+pip install -e .              # core: mcp + ase + jedi + numpy (works with EMT)
 pip install -e ".[fairchem]"  # add FAIRChem (torch + models) for UMA/eSEN
+pip install -e ".[lammps]"    # add LAMMPS as a classical force engine
+pip install -e ".[saddles]"   # add Sella + POUNCE for transition-state searches
 ```
 
-FAIRChem is **optional**. Every tool except `load_model` works with a plain ASE
-calculator (`attach_emt`), so you can develop and test without a GPU or model.
+ASE, numpy, jedi and mcp are **core** dependencies (installed automatically) — the
+server is fully usable out of the box with the built-in EMT calculator.
+
+### FAIRChem (optional)
+
+`pip install -e ".[fairchem]"` pulls in `fairchem-core` (PyTorch + models). To
+actually load a UMA model you also need:
+
+- a **Hugging Face account** with approved access to the `facebook/UMA` model
+  repository, and `huggingface-cli login` (or `HF_TOKEN`) set;
+- PyTorch for your platform (CUDA build for GPU; CPU works but is slower).
+
+Everything except `load_model` works with a plain ASE calculator (`attach_emt`),
+so you can develop and test without a GPU or model.
+
+### LAMMPS (optional)
+
+`pip install -e ".[lammps]"` installs the `lammps` Python package. LAMMPS is used
+as a **force engine** (classical potentials) while ASE drives the dynamics, so
+`attach_lammps` works with every steerable job (MD, relaxation, NEB, phonons,
+EOS, minima search).
+
+**macOS note (Homebrew MPICH):** the PyPI `lammps` wheel links
+`@rpath/libmpi.12.dylib` and `libpmpi.12.dylib`, which the dynamic loader can't
+find by default. If you have Homebrew's `mpich` (`brew install mpich`),
+`attach_lammps` **auto-symlinks** those libs into the `lammps` package directory
+on first use. If that can't be applied (read-only install, non-Homebrew MPI),
+either symlink them yourself or export before launching the server:
+
+```bash
+export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:$DYLD_FALLBACK_LIBRARY_PATH
+```
+
+Verify with: `python -c "from lammps import lammps; lammps(cmdargs=['-log','none','-screen','none']).close(); print('ok')"`.
+
+### Transition-state searches (optional)
+
+`pip install -e ".[saddles]"` adds two extra saddle-point backends:
+[`sella`](https://github.com/zadorlab/sella) (a rational-function ASE optimizer)
+and [`pounce-solver`](https://pypi.org/project/pounce-solver/) (multistart
+eigenvector following). The **dimer** method (`start_saddle_search`) is pure ASE
+and needs neither. See [`examples/saddles/`](examples/saddles/) for all three.
 
 ## Register with Claude Code
 
@@ -54,13 +96,18 @@ Add to your MCP config (see `examples/claude_mcp_config.json`):
 | `list_models` | List FAIRChem pretrained models |
 | `load_model` | Load a UMA/eSEN model as a resident calculator |
 | `attach_emt` | Attach a fast EMT calculator (no GPU/model) |
+| `attach_lammps` | Attach LAMMPS (classical potentials) as the force engine |
 | `build_structure` / `load_structure` | Make/register an ASE structure |
 | `start_relaxation` / `start_md` | Launch a background relaxation / MD (returns a `job_id`) |
 | `start_neb` | Launch a steerable nudged-elastic-band (reaction barrier) |
+| `start_saddle_search` | Transition state via the dimer method (Hessian-free) |
+| `start_sella_search` | Transition state via Sella (RFO + approximate Hessian) |
+| `start_pounce_saddles` | Enumerate saddles by Morse index (POUNCE eigenvector following) |
 | `start_phonons` | Launch a finite-displacement phonon calculation |
+| `start_eos_scan` | Scan cell strain → fit equation of state (V0, E0, bulk modulus) |
 | `start_minima_search` | Find multiple distinct relaxed geometries via deflation/flooding |
 | `get_status` / `get_trajectory` | Observe a running job |
-| `get_results` | Final results: NEB barrier/energies, phonon frequencies & stability, distinct minima |
+| `get_results` | Final results: NEB barrier/energies, phonon frequencies & stability, distinct minima, EOS fit |
 | `steer` | `pause`/`resume`/`abort`/`set_fmax`/`switch_optimizer`/`set_temperature`/`set_climb` |
 | `introspect` | Signatures/docstrings/members of installed code or live objects |
 | `execute` / `inspect_expr` | Run/eval Python in the shared session namespace |
@@ -114,6 +161,10 @@ workflows — adsorption energy, adsorption-site search, diffusion-barrier NEB, 
 surface-stability phonons — each as a runnable script **and** an MCP tool-call
 walkthrough. They run on EMT out of the box; set `FAIRCHEM_MCP_EXAMPLE_MODEL` for
 UMA.
+
+[`examples/saddles/`](examples/saddles/) covers the three single-ended
+transition-state routes — dimer, Sella, and POUNCE eigenvector following — on one
+shared system so you can compare them.
 
 ## Safety
 

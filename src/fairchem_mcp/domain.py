@@ -109,6 +109,90 @@ def attach_emt(session: Session) -> dict:
     return {"calculator_id": cid, "kind": "emt"}
 
 
+def _ensure_lammps_loadable() -> None:
+    """Best-effort fix for the macOS pip-LAMMPS + Homebrew-MPICH dylib mismatch.
+
+    The PyPI ``lammps`` wheel links ``@rpath/libmpi.12.dylib`` and
+    ``libpmpi.12.dylib``, which dyld cannot find unless they sit next to
+    ``liblammps`` (or ``DYLD_FALLBACK_LIBRARY_PATH`` points at Homebrew's lib).
+    If those libs are missing from the ``lammps`` package dir but present in a
+    standard Homebrew location, symlink them in (idempotent, non-destructive).
+    On other platforms, or if anything is already in place, this is a no-op.
+    """
+    import sys
+
+    if sys.platform != "darwin":
+        return
+    import glob
+    import importlib.util
+    import os
+
+    spec = importlib.util.find_spec("lammps")
+    if spec is None or not spec.submodule_search_locations:
+        return  # not installed; let the real import error surface to the caller
+    pkg_dir = list(spec.submodule_search_locations)[0]
+
+    needed = ["libmpi.12.dylib", "libpmpi.12.dylib"]
+    missing = [n for n in needed if not os.path.exists(os.path.join(pkg_dir, n))]
+    if not missing:
+        return
+    search = ["/opt/homebrew/lib", "/usr/local/lib"]
+    search += sorted(glob.glob("/opt/homebrew/Cellar/mpich/*/lib"), reverse=True)
+    for name in missing:
+        for d in search:
+            src = os.path.join(d, name)
+            if os.path.exists(src):
+                try:
+                    os.symlink(src, os.path.join(pkg_dir, name))
+                except OSError:
+                    pass  # racy/read-only; the import below will report clearly
+                break
+
+
+def attach_lammps(
+    session: Session,
+    pair_style: str,
+    pair_coeff: str | list,
+    atom_types: dict | None = None,
+    extra_cmds: list | None = None,
+    lammps_header: list | None = None,
+    log_file: str = "none",
+    keep_alive: bool = True,
+) -> dict:
+    """Attach LAMMPS (via ``ase.calculators.lammpslib.LAMMPSlib``) as a calculator.
+
+    LAMMPS is used as the force engine; ASE drives the dynamics, so the resulting
+    calculator works with **every** steerable job here — ``start_md``,
+    ``start_relaxation``, ``start_neb``, ``start_phonons``, ``start_eos_scan``,
+    ``start_minima_search`` — under the same pause/abort/switch_optimizer control.
+
+    ``pair_style`` and ``pair_coeff`` are raw LAMMPS commands (minus the keyword),
+    e.g. ``pair_style="lj/cut 7.0"`` with ``pair_coeff="1 1 0.4 2.34"``, or
+    ``pair_style="eam/alloy"`` with ``pair_coeff="* * Cu_u3.eam.alloy Cu"`` (a
+    potential file the LAMMPS run can find). ``atom_types`` maps element symbols to
+    LAMMPS type integers, e.g. ``{"Cu": 1}``. ``log_file="none"`` keeps LAMMPS off
+    stdout (required by the MCP stdio protocol).
+    """
+    _ensure_lammps_loadable()
+    from ase.calculators.lammpslib import LAMMPSlib
+
+    coeffs = [pair_coeff] if isinstance(pair_coeff, str) else list(pair_coeff)
+    lmpcmds = [f"pair_style {pair_style}"] + [f"pair_coeff {c}" for c in coeffs]
+    if extra_cmds:
+        lmpcmds += list(extra_cmds)
+
+    kwargs: dict = {"lmpcmds": lmpcmds, "keep_alive": keep_alive, "log_file": log_file}
+    if atom_types:
+        kwargs["atom_types"] = atom_types
+    if lammps_header:
+        kwargs["lammps_header"] = lammps_header
+
+    calc = LAMMPSlib(**kwargs)
+    info = {"kind": "lammps", "pair_style": pair_style, "pair_coeff": coeffs}
+    cid = session.add_calculator(calc, info=info)
+    return {"calculator_id": cid, **info}
+
+
 def list_models() -> dict:
     """List available FAIRChem pretrained models, if FAIRChem is installed."""
     try:
@@ -330,6 +414,262 @@ def start_minima_search(
     job.session = session
     JobManager(session).start_prepared(job)
     return {"job_id": job.id, "kind": "minima", "config": config}
+
+
+def start_eos_scan(
+    session: Session,
+    structure_id: str,
+    calculator_id: str,
+    n_points: int = 11,
+    strain_range: float = 0.05,
+    relax_ions: bool = False,
+    optimizer: str = "FIRE",
+    fmax: float = 0.05,
+    steps: int = 200,
+    step_delay: float = 0.0,
+) -> dict:
+    """Scan isotropic cell strain and fit an equation of state (V0, E0, B).
+
+    A one-variable lab: the cell volume is the single knob. Builds ``n_points``
+    strained copies spanning ``(1 ± strain_range)·V0``, evaluates the energy at
+    each (relaxing the ionic positions at fixed cell when ``relax_ions``), and
+    fits a Birch-Murnaghan-style EOS for the equilibrium volume, energy, and bulk
+    modulus (GPa). Needs a 3-D periodic structure (a bulk crystal). Steerable via
+    abort/pause between volume points; poll get_status for done/total.
+    """
+    template = session.get_structure(structure_id).copy()
+    template.calc = None
+    base = session.get_calculator(calculator_id)
+
+    config = {
+        "n_points": n_points,
+        "strain_range": strain_range,
+        "relax_ions": relax_ions,
+        "optimizer": optimizer,
+        "fmax": fmax,
+        "steps": steps,
+        "step_delay": step_delay,
+    }
+    job = Job(session._new_id("job"), None, "eos", config)
+    job.template = template
+    job.base_calc = base
+    job.session = session
+    JobManager(session).start_prepared(job)
+    return {"job_id": job.id, "kind": "eos", "config": config}
+
+
+def start_saddle_search(
+    session: Session,
+    structure_id: str,
+    calculator_id: str,
+    displacement_vector: list | None = None,
+    displace_magnitude: float = 0.1,
+    dimer_separation: float = 0.01,
+    fmax: float = 0.05,
+    steps: int = 200,
+    seed: int = 0,
+    step_delay: float = 0.0,
+) -> dict:
+    """Find a transition state with the dimer method (Hessian-free, forces only).
+
+    Starts from ``structure_id`` (typically a relaxed minimum, lightly nudged
+    toward the saddle), ascends the lowest-curvature mode and descends the rest.
+    A negative converged curvature confirms an index-1 saddle. Robust with noisy
+    ML potentials since no Hessian is built.
+
+    ``displacement_vector`` (length-3N list, Å) seeds the search direction; if
+    omitted, a random kick of ``displace_magnitude`` Å is applied to the
+    unconstrained atoms. Steerable via abort/pause/set_fmax. The MinModeAtoms
+    object is bound as 'dimer' in the namespace for the execute/inspect hatch.
+    """
+    import numpy as np
+    from ase.mep import DimerControl, MinModeAtoms
+
+    atoms = session.get_structure(structure_id).copy()
+    atoms.calc = session.get_calculator(calculator_id)
+    n = len(atoms)
+
+    from .jobs import _free_indices
+
+    free = _free_indices(atoms)
+    if displacement_vector is not None:
+        dvec = np.asarray(displacement_vector, dtype=float).reshape(n, 3)
+    else:
+        rng = np.random.default_rng(seed)
+        dvec = np.zeros((n, 3))
+        dvec[free] = rng.normal(scale=displace_magnitude, size=(len(free), 3))
+
+    control = DimerControl(
+        initial_eigenmode_method="displacement",
+        displacement_method="vector",
+        logfile=None,
+        dimer_separation=dimer_separation,
+    )
+    dimer = MinModeAtoms(atoms, control)
+    # mask = which atoms participate in the dimer mode (the unconstrained ones);
+    # also silences ASE's "couldn't figure out which atoms to displace" warning.
+    mask = [i in set(free) for i in range(n)]
+    dimer.displace(displacement_vector=dvec, mask=mask)
+
+    config = {
+        "fmax": fmax,
+        "steps": steps,
+        "dimer_separation": dimer_separation,
+        "displace_magnitude": displace_magnitude,
+        "seed": seed,
+        "step_delay": step_delay,
+    }
+    job = Job(session._new_id("job"), None, "dimer", config)
+    job.dimer = dimer
+    job.session = session
+    JobManager(session).start_prepared(job)
+
+    session.namespace["dimer"] = dimer
+    return {"job_id": job.id, "kind": "dimer", "config": config}
+
+
+def start_sella_search(
+    session: Session,
+    structure_id: str,
+    calculator_id: str,
+    order: int = 1,
+    fmax: float = 0.05,
+    steps: int = 200,
+    internal: bool = False,
+    displacement_vector: list | None = None,
+    displace_magnitude: float = 0.0,
+    seed: int = 0,
+    step_delay: float = 0.0,
+) -> dict:
+    """Find an order-``order`` saddle with Sella (RFO + approximate Hessian).
+
+    Sella is an ASE Optimizer that climbs toward a saddle of the requested
+    ``order`` (1 = transition state) using a partitioned rational-function step on
+    an approximate Hessian it refines as it goes — so it converges in few force
+    calls and drops straight into the steering loop (abort/pause/set_fmax; the
+    Sella object is kept across set_fmax so its Hessian survives).
+
+    Unlike the dimer it needs no product state and unlike POUNCE it needs no full
+    Hessian. ``internal=True`` switches to automatic internal (bond/angle/dihedral)
+    coordinates, which helps for molecules. ``displacement_vector`` (length-3N list,
+    Å) or a random ``displace_magnitude`` kick on the unconstrained atoms seeds the
+    search away from the minimum. The Sella object is bound as 'sella' in the
+    namespace for the execute/inspect hatch. Requires `sella` (pip install sella).
+    """
+    from sella import Sella
+
+    atoms = session.get_structure(structure_id).copy()
+    atoms.calc = session.get_calculator(calculator_id)
+    n = len(atoms)
+
+    from .jobs import _free_indices
+
+    free = _free_indices(atoms)
+    if displacement_vector is not None:
+        import numpy as np
+
+        atoms.set_positions(
+            atoms.get_positions()
+            + np.asarray(displacement_vector, dtype=float).reshape(n, 3)
+        )
+    elif displace_magnitude:
+        import numpy as np
+
+        rng = np.random.default_rng(seed)
+        pos = atoms.get_positions()
+        pos[free] += rng.normal(scale=displace_magnitude, size=(len(free), 3))
+        atoms.set_positions(pos)
+
+    # logfile=None keeps Sella off stdout (the stdio transport reserves it).
+    sella = Sella(atoms, order=order, internal=internal, logfile=None)
+
+    config = {
+        "order": order,
+        "fmax": fmax,
+        "steps": steps,
+        "internal": internal,
+        "displace_magnitude": displace_magnitude,
+        "seed": seed,
+        "step_delay": step_delay,
+    }
+    job = Job(session._new_id("job"), atoms, "sella", config)
+    job.sella = sella
+    job.session = session
+    JobManager(session).start_prepared(job)
+
+    session.namespace["sella"] = sella
+    return {"job_id": job.id, "kind": "sella", "config": config}
+
+
+def start_pounce_saddles(
+    session: Session,
+    structure_id: str,
+    calculator_id: str,
+    active_indices: list | None = None,
+    index: int = 1,
+    n_saddles: int = 5,
+    fd_delta: float = 0.01,
+    grad_tol: float = 1e-3,
+    max_step: float = 0.2,
+    dedup: float = 0.05,
+    local_max_iter: int = 200,
+    max_solves: int | None = None,
+    seed: int = 0,
+    displace_magnitude: float = 0.0,
+) -> dict:
+    """Enumerate index-``index`` saddle points with POUNCE's ``find_saddles``.
+
+    Multistart eigenvector following (Cerjan-Miller) with a full Hessian and
+    explicit Morse-index classification — complements the single-ended dimer when
+    you want *several* distinct saddles labeled by index. The optimization
+    variables are the Cartesian coordinates of ``active_indices`` (default: atoms
+    not held by FixAtoms); the rest stay frozen. fun/grad come from the calculator
+    (∇E = −F); the Hessian is a central finite difference of forces (``fd_delta``).
+
+    For float32 ML potentials (e.g. UMA), loosen ``grad_tol`` (default 1e-3) and
+    prefer a float64 model — curvature/Morse counting is noise-sensitive. POUNCE
+    owns the multistart loop, so this job runs to completion (abort is not honored
+    mid-solve).
+    """
+    atoms = session.get_structure(structure_id).copy()
+    atoms.calc = session.get_calculator(calculator_id)
+
+    from .jobs import _free_indices
+
+    if active_indices is None:
+        active_indices = _free_indices(atoms)
+    if not active_indices:
+        raise ValueError(
+            "no active atoms to search over (all atoms are fixed); pass "
+            "active_indices explicitly"
+        )
+
+    if displace_magnitude:
+        import numpy as np
+
+        rng = np.random.default_rng(seed)
+        pos = atoms.get_positions()
+        aidx = np.asarray(active_indices, dtype=int)
+        pos[aidx] += rng.normal(scale=displace_magnitude, size=(len(aidx), 3))
+        atoms.set_positions(pos)
+
+    config = {
+        "active_indices": list(active_indices),
+        "index": index,
+        "n_saddles": n_saddles,
+        "fd_delta": fd_delta,
+        "grad_tol": grad_tol,
+        "max_step": max_step,
+        "dedup": dedup,
+        "local_max_iter": local_max_iter,
+        "max_solves": max_solves,
+        "seed": seed,
+    }
+    job = Job(session._new_id("job"), None, "saddles", config)
+    job.template = atoms
+    job.session = session
+    JobManager(session).start_prepared(job)
+    return {"job_id": job.id, "kind": "saddles", "config": config}
 
 
 def start_phonons(

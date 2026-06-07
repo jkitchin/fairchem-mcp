@@ -59,6 +59,34 @@ def attach_emt() -> dict:
     return domain.attach_emt(SESSION)
 
 
+@mcp.tool()
+def attach_lammps(
+    pair_style: str,
+    pair_coeff: str,
+    atom_types: dict | None = None,
+    extra_cmds: list[str] | None = None,
+    log_file: str = "none",
+) -> dict:
+    """Attach LAMMPS as a calculator (via ASE LAMMPSlib); LAMMPS computes the
+    energy/forces, ASE drives the dynamics.
+
+    Works with every steerable job (start_md, start_relaxation, start_neb,
+    start_phonons, start_eos_scan, start_minima_search). pair_style/pair_coeff are
+    raw LAMMPS commands minus the keyword, e.g. pair_style="lj/cut 7.0",
+    pair_coeff="1 1 0.4 2.34"; or pair_style="eam/alloy",
+    pair_coeff="* * Cu_u3.eam.alloy Cu". atom_types maps symbols to LAMMPS type
+    ints, e.g. {"Cu": 1}. Needs the `lammps` package (see README install notes;
+    the macOS Homebrew-MPICH dylib fix is applied automatically).
+    """
+    try:
+        return domain.attach_lammps(
+            SESSION, pair_style, pair_coeff,
+            atom_types=atom_types, extra_cmds=extra_cmds, log_file=log_file,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
 # ---------------------------------------------------------------------------
 # Structures
 # ---------------------------------------------------------------------------
@@ -174,6 +202,146 @@ def start_neb(
 
 
 @mcp.tool()
+def start_eos_scan(
+    structure_id: str,
+    calculator_id: str,
+    n_points: int = 11,
+    strain_range: float = 0.05,
+    relax_ions: bool = False,
+    optimizer: str = "FIRE",
+    fmax: float = 0.05,
+    steps: int = 200,
+    step_delay: float = 0.0,
+) -> dict:
+    """Scan isotropic cell strain and fit an equation of state (background job).
+
+    A one-variable lab over cell volume. Evaluates the energy at n_points volumes
+    spanning (1 ± strain_range)·V0 (relaxing ions at fixed cell when relax_ions),
+    then fits a Birch-Murnaghan-style EOS. Needs a 3-D periodic structure (a bulk
+    crystal). Poll get_status for done/total; get_results returns volumes, energies,
+    and the fitted V0, E0, and bulk_modulus_GPa. abort/pause act between points.
+    """
+    try:
+        return domain.start_eos_scan(
+            SESSION, structure_id, calculator_id,
+            n_points=n_points, strain_range=strain_range, relax_ions=relax_ions,
+            optimizer=optimizer, fmax=fmax, steps=steps, step_delay=step_delay,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def start_saddle_search(
+    structure_id: str,
+    calculator_id: str,
+    displacement_vector: list[float] | None = None,
+    displace_magnitude: float = 0.1,
+    dimer_separation: float = 0.01,
+    fmax: float = 0.05,
+    steps: int = 200,
+    seed: int = 0,
+    step_delay: float = 0.0,
+) -> dict:
+    """Find a transition state with the dimer method (Hessian-free; forces only).
+
+    Single-ended saddle search from a (usually relaxed) structure: ascends the
+    lowest-curvature mode, descends the rest. A negative converged curvature
+    confirms an index-1 saddle. Robust with noisy ML potentials (no Hessian).
+    displacement_vector (length-3N, Å) seeds the direction; otherwise a random
+    displace_magnitude-Å kick is applied to the unconstrained atoms. Poll
+    get_status for energy/max_force/curvature; get_results returns the saddle
+    energy, curvature, structure_id, and is_index1_saddle. Steer abort/pause/set_fmax.
+    """
+    try:
+        return domain.start_saddle_search(
+            SESSION, structure_id, calculator_id,
+            displacement_vector=displacement_vector,
+            displace_magnitude=displace_magnitude, dimer_separation=dimer_separation,
+            fmax=fmax, steps=steps, seed=seed, step_delay=step_delay,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def start_sella_search(
+    structure_id: str,
+    calculator_id: str,
+    order: int = 1,
+    fmax: float = 0.05,
+    steps: int = 200,
+    internal: bool = False,
+    displacement_vector: list[float] | None = None,
+    displace_magnitude: float = 0.0,
+    seed: int = 0,
+    step_delay: float = 0.0,
+) -> dict:
+    """Find an order-`order` saddle with Sella (RFO + refined approximate Hessian).
+
+    A third route to transition states (order=1), complementing the dimer and
+    POUNCE. Sella is an ASE optimizer that climbs toward a saddle using a
+    partitioned rational-function step on an approximate Hessian it refines as it
+    goes, so it converges in few force calls and is fully steerable
+    (abort/pause/set_fmax; its Hessian survives set_fmax). Needs no product state
+    (unlike NEB) and no full Hessian (unlike POUNCE). internal=True uses automatic
+    internal coordinates (good for molecules). displacement_vector (length-3N, Å) or
+    a random displace_magnitude-Å kick on the unconstrained atoms seeds the search.
+    Poll get_status for energy/max_force/lowest_eigenvalue; get_results returns the
+    saddle energy, lowest_eigenvalue, n_negative_eigenvalues, is_target_order_saddle,
+    and structure_id. Requires the `sella` package.
+    """
+    try:
+        return domain.start_sella_search(
+            SESSION, structure_id, calculator_id,
+            order=order, fmax=fmax, steps=steps, internal=internal,
+            displacement_vector=displacement_vector,
+            displace_magnitude=displace_magnitude, seed=seed, step_delay=step_delay,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def start_pounce_saddles(
+    structure_id: str,
+    calculator_id: str,
+    active_indices: list[int] | None = None,
+    index: int = 1,
+    n_saddles: int = 5,
+    fd_delta: float = 0.01,
+    grad_tol: float = 1e-3,
+    max_step: float = 0.2,
+    dedup: float = 0.05,
+    local_max_iter: int = 200,
+    max_solves: int | None = None,
+    seed: int = 0,
+    displace_magnitude: float = 0.0,
+) -> dict:
+    """Enumerate index-`index` saddles via POUNCE multistart eigenvector following.
+
+    Complements the dimer: returns *several* distinct saddles, each labeled by its
+    Morse index (count of negative Hessian eigenvalues). Variables are the
+    coordinates of active_indices (default: atoms not held by FixAtoms); the rest
+    stay frozen (keeps it low-dimensional and free of rigid zero modes). fun/grad
+    from the calculator (∇E=−F); Hessian by central finite difference (fd_delta).
+    For float32 ML potentials (UMA), loosen grad_tol and prefer float64. Requires
+    the `pounce-solver` package. get_results returns saddles[] with energy,
+    morse_index, grad_norm, eigenvalues. Runs to completion (no mid-solve abort).
+    """
+    try:
+        return domain.start_pounce_saddles(
+            SESSION, structure_id, calculator_id,
+            active_indices=active_indices, index=index, n_saddles=n_saddles,
+            fd_delta=fd_delta, grad_tol=grad_tol, max_step=max_step, dedup=dedup,
+            local_max_iter=local_max_iter, max_solves=max_solves, seed=seed,
+            displace_magnitude=displace_magnitude,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
 def start_phonons(
     structure_id: str,
     calculator_id: str,
@@ -267,8 +435,9 @@ def get_trajectory(job_id: str, last_n: int = 20) -> dict:
 
 @mcp.tool()
 def get_results(job_id: str) -> dict:
-    """Return a job's final results, if any: NEB barrier/energies, or phonon
-    gamma frequencies and stability. None until the job finishes."""
+    """Return a job's final results, if any: NEB barrier/energies, phonon gamma
+    frequencies and stability, distinct minima, or EOS V0/E0/bulk_modulus_GPa.
+    None until the job finishes."""
     try:
         return {"job_id": job_id, "result": SESSION.get_job(job_id).result}
     except Exception as exc:  # noqa: BLE001

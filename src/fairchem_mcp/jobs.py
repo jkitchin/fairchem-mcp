@@ -61,14 +61,16 @@ class Job:
 
     def __init__(self, job_id: str, atoms: Any, kind: str, config: dict):
         self.id = job_id
-        self.atoms = atoms  # single structure (relax/md); None for neb/phonon/minima
-        self.kind = kind  # "relax" | "md" | "neb" | "phonon" | "minima"
+        self.atoms = atoms  # single structure (relax/md); None for neb/phonon/minima/eos
+        self.kind = kind  # "relax" | "md" | "neb" | "phonon" | "minima" | "eos"
         self.config = dict(config)
 
-        # Populated by the NEB / phonon runners.
+        # Populated by the NEB / phonon / dimer runners.
         self.neb: Any = None
         self.images: list[Any] | None = None
         self.ph: Any = None
+        self.dimer: Any = None  # MinModeAtoms for a dimer saddle search
+        self.sella: Any = None  # Sella optimizer for an internal-coordinate TS search
         self.result: dict | None = None
 
         # Populated by the minima (multi-minimum search) runner.
@@ -95,6 +97,10 @@ class Job:
             "neb": _run_neb,
             "phonon": _run_phonon,
             "minima": _run_minima,
+            "eos": _run_eos,
+            "dimer": _run_dimer,
+            "sella": _run_sella,
+            "saddles": _run_saddles,
         }[self.kind]
         self._thread = threading.Thread(
             target=self._guard, args=(runner,), name=f"job-{self.id}", daemon=True
@@ -182,7 +188,8 @@ class Job:
         }
         # Surface kind-specific fields from the latest snapshot when present.
         for key in ("barrier", "fraction", "done", "total", "temperature_K",
-                    "n_found", "target", "phase"):
+                    "n_found", "target", "phase", "volume", "curvature",
+                    "lowest_eigenvalue"):
             if key in latest:
                 out[key] = latest[key]
         if result is not None:
@@ -777,6 +784,428 @@ def _run_minima(job: Job) -> None:
                 break
 
     _finalize_minima(job, "converged" if found else "finished", found)
+
+
+# ---------------------------------------------------------------------------
+# Equation of state (a one-variable scan: isotropic cell strain vs. energy)
+# ---------------------------------------------------------------------------
+
+def _finalize_eos(job: Job, status: str, volumes: list, energies: list) -> None:
+    """Fit a Birch-Murnaghan-style EOS to (V, E) and report V0, E0, bulk modulus."""
+    result: dict = {
+        "volumes": [round(v, 6) for v in volumes],
+        "energies": [round(e, 6) for e in energies],
+        "n_points": len(volumes),
+    }
+    if len(volumes) >= 5:
+        try:
+            from ase.eos import EquationOfState
+            from ase.units import kJ
+
+            eos = EquationOfState(list(volumes), list(energies))
+            v0, e0, B = eos.fit()
+            result.update({
+                "V0": round(float(v0), 6),
+                "E0": round(float(e0), 6),
+                "bulk_modulus_GPa": round(float(B / kJ * 1.0e24), 4),
+            })
+        except Exception as exc:  # noqa: BLE001
+            result["fit_error"] = str(exc)
+    job.result = result
+    with job._lock:
+        job.status = status
+
+
+def _run_eos(job: Job) -> None:
+    """Scan isotropic cell strain and (optionally) relax ions at each volume.
+
+    Builds ``n_points`` copies of the structure with the cell scaled so the volume
+    spans ``(1 ± strain_range)·V0``, evaluates the energy at each (relaxing the
+    ionic positions at fixed cell first when ``relax_ions``), and fits an equation
+    of state for the equilibrium volume, energy, and bulk modulus. ``abort`` /
+    ``pause`` act between volume points. This is the canonical E–V teaching lab and
+    a genuine workhorse for bulk crystals.
+    """
+    cfg = job.config
+    template = job.template
+    base = job.base_calc
+    n_points = int(cfg.get("n_points", 11))
+    strain_range = float(cfg.get("strain_range", 0.05))
+    relax_ions = bool(cfg.get("relax_ions", False))
+    optimizer_name = cfg.get("optimizer", "FIRE")
+    fmax = float(cfg.get("fmax", 0.05))
+    max_steps = int(cfg.get("steps", 200))
+    step_delay = float(cfg.get("step_delay", 0.0))
+
+    cell0 = np.asarray(template.get_cell(), dtype=float)
+    if not all(bool(p) for p in template.pbc) or abs(float(np.linalg.det(cell0))) < 1e-8:
+        raise ValueError(
+            "EOS scan needs a 3-D periodic cell; this structure is not periodic "
+            "in all directions (build a bulk crystal, not a molecule/cluster)"
+        )
+
+    # Linear scale factors whose cube (the volume ratio) is evenly spaced.
+    vol_ratios = np.linspace(1.0 - strain_range, 1.0 + strain_range, n_points)
+    scales = vol_ratios ** (1.0 / 3.0)
+
+    with job._lock:
+        job.status = "running"
+
+    volumes: list[float] = []
+    energies: list[float] = []
+    for i, s in enumerate(scales):
+        for cmd in job._drain_controls():
+            if cmd.kind == "abort":
+                _finalize_eos(job, "aborted", volumes, energies)
+                return
+            if cmd.kind == "pause" and job._wait_while_paused():
+                _finalize_eos(job, "aborted", volumes, energies)
+                return
+
+        work = template.copy()
+        work.set_cell(cell0 * s, scale_atoms=True)
+        work.calc = base
+        if relax_ions:
+            opt = make_optimizer(optimizer_name, work)
+            for _ in opt.irun(fmax=fmax, steps=max_steps):
+                pass
+
+        v = float(work.get_volume())
+        e = float(work.get_potential_energy())
+        volumes.append(v)
+        energies.append(e)
+        job.step = i + 1
+        job.record_fields(
+            energy=e, volume=v, done=i + 1, total=n_points,
+            fraction=(i + 1) / n_points,
+        )
+        if step_delay:
+            time.sleep(step_delay)
+
+    _finalize_eos(job, "finished", volumes, energies)
+
+
+# ---------------------------------------------------------------------------
+# Saddle points, route 1: the dimer method (Hessian-free, single-ended).
+# ASE's MinModeTranslate is an Optimizer with irun(), so it drops straight into
+# the steering loop. Only forces are needed — robust with noisy ML potentials.
+# ---------------------------------------------------------------------------
+
+def _plain_atoms(src: Any) -> Any:
+    """A clean ASE Atoms copy (drops calculator and any MinModeAtoms wrapping)."""
+    from ase import Atoms
+
+    return Atoms(
+        numbers=src.get_atomic_numbers(),
+        positions=src.get_positions(),
+        cell=src.get_cell(),
+        pbc=src.get_pbc(),
+    )
+
+
+def _free_indices(atoms: Any) -> list[int]:
+    """Indices of atoms not pinned by a FixAtoms constraint."""
+    from ase.constraints import FixAtoms
+
+    fixed: set[int] = set()
+    for con in atoms.constraints:
+        if isinstance(con, FixAtoms):
+            fixed.update(int(i) for i in con.get_indices())
+    return [i for i in range(len(atoms)) if i not in fixed]
+
+
+def _record_dimer_step(job: Job, d: Any, converged: bool = False) -> None:
+    energy = float(d.get_potential_energy())
+    fmax = float(np.linalg.norm(d.get_forces(), axis=1).max())
+    job.record_fields(
+        energy=energy, max_force=fmax, curvature=float(d.get_curvature()),
+        converged=bool(converged),
+    )
+
+
+def _finalize_dimer(job: Job, status: str) -> None:
+    d = job.dimer
+    curv = float(d.get_curvature())
+    sid = None
+    if job.session is not None:
+        sid = job.session.add_structure(_plain_atoms(d))
+    job.result = {
+        "energy": round(float(d.get_potential_energy()), 6),
+        "max_force": round(float(np.linalg.norm(d.get_forces(), axis=1).max()), 6),
+        "curvature": round(curv, 6),
+        "is_index1_saddle": bool(curv < 0.0),
+        "structure_id": sid,
+    }
+    with job._lock:
+        job.status = status
+
+
+def _run_dimer(job: Job) -> None:
+    """Drive an ASE dimer (min-mode following) saddle search, steerable.
+
+    The dimer ascends the lowest-curvature mode and descends the rest using only
+    forces. A negative converged curvature confirms an index-1 saddle (transition
+    state). Steer set: abort / pause / set_fmax (switch_optimizer doesn't apply —
+    the dimer translator is the optimizer).
+    """
+    from ase.mep import MinModeTranslate
+
+    cfg = job.config
+    fmax = float(cfg.get("fmax", 0.05))
+    max_steps = int(cfg.get("steps", 200))
+    step_delay = float(cfg.get("step_delay", 0.0))
+    d = job.dimer
+
+    with job._lock:
+        job.status = "running"
+    _record_dimer_step(job, d)
+
+    local_step = 0
+    while True:
+        opt = MinModeTranslate(d, logfile=None)
+        restart = False
+        for converged in opt.irun(fmax=fmax, steps=max_steps - local_step):
+            job.step += 1
+            local_step += 1
+            _record_dimer_step(job, d, converged=bool(converged))
+            if step_delay:
+                time.sleep(step_delay)
+            if bool(converged):
+                _finalize_dimer(job, "converged")
+                return
+            for cmd in job._drain_controls():
+                if cmd.kind == "abort":
+                    _finalize_dimer(job, "aborted")
+                    return
+                if cmd.kind == "pause":
+                    if job._wait_while_paused():
+                        _finalize_dimer(job, "aborted")
+                        return
+                elif cmd.kind == "set_fmax":
+                    fmax = float(cmd.params["fmax"])
+                    restart = True
+            if restart:
+                break
+            if local_step >= max_steps:
+                _finalize_dimer(job, "finished")
+                return
+        if not restart:
+            _finalize_dimer(job, "finished")
+            return
+
+
+# ---------------------------------------------------------------------------
+# Saddle points, route 2: Sella (partitioned rational-function optimization with
+# internal coordinates and an approximate Hessian). Sella is an ASE Optimizer, so
+# it drops straight into the irun() steering loop like a relaxation — but it
+# climbs toward an order-k saddle instead of a minimum. The approximate Hessian it
+# maintains lets us report the lowest eigenvalue live and classify the converged
+# point by its negative-eigenvalue count.
+# ---------------------------------------------------------------------------
+
+def _sella_spectrum(opt: Any) -> tuple[Any, Any]:
+    """(lowest_eigenvalue, n_negative) from Sella's approximate Hessian, or (None, None).
+
+    Uses the cached eigenvalues when Sella has already diagonalized the Hessian
+    (cheap); otherwise materializes and diagonalizes it once. Returns (None, None)
+    before the first diagonalization, so callers must tolerate missing values.
+    """
+    try:
+        H = opt.pes.get_H()
+        if H is None:
+            return None, None
+        evals = getattr(H, "evals", None)
+        if evals is None:
+            evals = np.linalg.eigvalsh(H.asarray())
+        evals = np.asarray(evals, dtype=float)
+        if evals.size == 0:
+            return None, None
+        return float(evals.min()), int((evals < 0.0).sum())
+    except Exception:  # noqa: BLE001 - Hessian not ready yet; report nothing
+        return None, None
+
+
+def _record_sella_step(job: Job, opt: Any, converged: bool = False) -> None:
+    atoms = job.atoms
+    energy = float(atoms.get_potential_energy())
+    fmax = float(np.linalg.norm(atoms.get_forces(), axis=1).max())
+    low, _ = _sella_spectrum(opt)
+    fields = {"energy": energy, "max_force": fmax, "converged": bool(converged)}
+    if low is not None:
+        fields["lowest_eigenvalue"] = round(low, 6)
+    job.record_fields(**fields)
+
+
+def _finalize_sella(job: Job, status: str) -> None:
+    opt = job.sella
+    atoms = job.atoms
+    order = int(job.config.get("order", 1))
+    low, n_neg = _sella_spectrum(opt)
+    sid = None
+    if job.session is not None:
+        sid = job.session.add_structure(_plain_atoms(atoms))
+    job.result = {
+        "energy": round(float(atoms.get_potential_energy()), 6),
+        "max_force": round(float(np.linalg.norm(atoms.get_forces(), axis=1).max()), 6),
+        "order_requested": order,
+        "lowest_eigenvalue": round(low, 6) if low is not None else None,
+        "n_negative_eigenvalues": n_neg,
+        "is_target_order_saddle": (n_neg == order) if n_neg is not None else None,
+        "structure_id": sid,
+    }
+    try:
+        opt.close()
+    except Exception:  # noqa: BLE001 - best-effort IOContext cleanup
+        pass
+    with job._lock:
+        job.status = status
+
+
+def _run_sella(job: Job) -> None:
+    """Drive a Sella saddle-point optimization, honoring control commands.
+
+    Sella climbs toward an order-``order`` saddle (1 = transition state) using a
+    partitioned rational-function step on an approximate, internal-coordinate
+    Hessian. It is an ASE Optimizer, so the loop mirrors ``_run_relax``: abort /
+    pause / set_fmax are honored between steps; switch_optimizer does not apply
+    (Sella *is* the optimizer, and switching would discard its Hessian). The
+    Sella object persists across set_fmax restarts so the Hessian is preserved.
+    """
+    cfg = job.config
+    fmax = float(cfg.get("fmax", 0.05))
+    max_steps = int(cfg.get("steps", 200))
+    step_delay = float(cfg.get("step_delay", 0.0))
+    opt = job.sella
+
+    with job._lock:
+        job.status = "running"
+    _record_sella_step(job, opt)
+
+    local_step = 0
+    while True:
+        restart = False
+        for converged in opt.irun(fmax=fmax, steps=max_steps - local_step):
+            job.step += 1
+            local_step += 1
+            _record_sella_step(job, opt, converged=bool(converged))
+            if step_delay:
+                time.sleep(step_delay)
+            if bool(converged):
+                _finalize_sella(job, "converged")
+                return
+            for cmd in job._drain_controls():
+                if cmd.kind == "abort":
+                    _finalize_sella(job, "aborted")
+                    return
+                if cmd.kind == "pause":
+                    if job._wait_while_paused():
+                        _finalize_sella(job, "aborted")
+                        return
+                elif cmd.kind == "set_fmax":
+                    fmax = float(cmd.params["fmax"])
+                    restart = True  # re-enter irun on the SAME opt (Hessian kept)
+            if restart:
+                break
+            if local_step >= max_steps:
+                _finalize_sella(job, "finished")
+                return
+        if not restart:
+            _finalize_sella(job, "finished")
+            return
+
+
+# ---------------------------------------------------------------------------
+# Saddle points, route 3: POUNCE find_saddles (multistart eigenvector following,
+# full Hessian, explicit Morse-index classification). The active-atom positions
+# are the optimization variables; the Hessian is built by central differences of
+# the forces, so any ASE calculator works. POUNCE owns the multistart loop, so
+# this job runs to completion on the worker thread (no mid-flight steering).
+# ---------------------------------------------------------------------------
+
+def _run_saddles(job: Job) -> None:
+    """Enumerate index-k saddle points with POUNCE's ``find_saddles``.
+
+    Variables are the Cartesian coordinates of the *active* atoms (default: those
+    not held by a FixAtoms constraint); the rest stay frozen, which keeps the
+    problem low-dimensional and free of the rigid translational/rotational zero
+    modes that confuse a full-atom Hessian. fun/grad come straight from the
+    calculator (∇E = −F); the Hessian is a central finite difference of the
+    forces. Each found saddle is registered as a structure with its Morse index.
+    """
+    from pounce import find_saddles
+
+    cfg = job.config
+    atoms = job.template
+    active = list(cfg["active_indices"])
+    delta = float(cfg.get("fd_delta", 0.01))
+    index = int(cfg.get("index", 1))
+    n_saddles = int(cfg.get("n_saddles", 5))
+    grad_tol = float(cfg.get("grad_tol", 1e-3))
+    max_step = float(cfg.get("max_step", 0.2))
+    dedup = float(cfg.get("dedup", 0.05))
+    seed = int(cfg.get("seed", 0))
+    local_max_iter = int(cfg.get("local_max_iter", 200))
+    max_solves = cfg.get("max_solves")
+
+    base = atoms.get_positions()
+    aidx = np.asarray(active, dtype=int)
+    x0 = base[aidx].ravel().copy()
+
+    def _set_x(x: np.ndarray) -> None:
+        pos = base.copy()
+        pos[aidx] = np.asarray(x, float).reshape(-1, 3)
+        atoms.set_positions(pos)
+
+    def fun(x):
+        _set_x(x)
+        return float(atoms.get_potential_energy())
+
+    def grad(x):
+        _set_x(x)
+        return -atoms.get_forces()[aidx].ravel()
+
+    def hess(x):
+        x = np.asarray(x, float)
+        n = x.size
+        H = np.zeros((n, n))
+        for i in range(n):
+            xp = x.copy(); xp[i] += delta
+            xm = x.copy(); xm[i] -= delta
+            H[:, i] = (grad(xp) - grad(xm)) / (2.0 * delta)
+        return 0.5 * (H + H.T)
+
+    with job._lock:
+        job.status = "running"
+    job.record_fields(energy=fun(x0), n_found=0, target=n_saddles, phase="solving")
+
+    res = find_saddles(
+        fun, x0, grad=grad, hess=hess, index=index, n_saddles=n_saddles,
+        grad_tol=grad_tol, max_step=max_step, dedup=dedup, seed=seed,
+        local_max_iter=local_max_iter,
+        **({"max_solves": int(max_solves)} if max_solves else {}),
+    )
+
+    saddles = []
+    for p in res.points:
+        _set_x(p.x)
+        sid = job.session.add_structure(_plain_atoms(atoms)) if job.session else None
+        saddles.append({
+            "structure_id": sid,
+            "energy": round(float(p.f), 6),
+            "morse_index": int(p.index),
+            "grad_norm": round(float(p.grad_norm), 6),
+            "eigenvalues": [round(float(e), 6) for e in p.eigvalues],
+        })
+    saddles.sort(key=lambda r: r["energy"])
+    job.result = {
+        "n_found": len(saddles),
+        "solver_status": res.status,
+        "n_solves": res.n_solves,
+        "saddles": saddles,
+    }
+    job.record_fields(n_found=len(saddles), target=n_saddles, phase="done")
+    with job._lock:
+        job.status = "converged" if saddles else "finished"
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,14 @@ dependencies = [
 # load_model works with plain ASE calculators (e.g. EMT), so the server is
 # useful for development and testing without it.
 fairchem = ["fairchem-core>=2.0"]
+# LAMMPS as an ASE calculator (classical potentials, used as the force engine
+# while ASE drives the dynamics). Optional; see the README for the macOS
+# Homebrew-MPICH dylib note.
+lammps = ["lammps"]
+# Saddle-point / transition-state search backends (optional). The dimer method
+# is built in (ASE); these add the other two routes: Sella (RFO optimizer) and
+# POUNCE's multistart eigenvector following.
+saddles = ["sella", "pounce-solver"]
 test = ["pytest"]
 
 [project.scripts]
