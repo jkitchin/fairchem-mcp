@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "fairchem": {
+      "command": "fairchem-mcp",
+      "args": []
+    }
+  }
+}
