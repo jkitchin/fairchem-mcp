@@ -105,6 +105,8 @@ Add to your MCP config (see `examples/claude_mcp_config.json`):
 | `start_pounce_saddles` | Enumerate saddles by Morse index (POUNCE eigenvector following) |
 | `start_phonons` | Launch a finite-displacement phonon calculation |
 | `start_eos_scan` | Scan cell strain → fit equation of state (V0, E0, bulk modulus) |
+| `start_elastic_scan` | Stress-vs-strain → elastic tensor (C_ij), VRH moduli, Born stability |
+| `start_convex_hull` | Formation energies + convex hull (phase stability, energy above hull) |
 | `start_minima_search` | Find multiple distinct relaxed geometries via deflation/flooding |
 | `get_status` / `get_trajectory` | Observe a running job |
 | `get_results` | Final results: NEB barrier/energies, phonon frequencies & stability, distinct minima, EOS fit |
@@ -165,6 +167,11 @@ UMA.
 [`examples/saddles/`](examples/saddles/) covers the three single-ended
 transition-state routes — dimer, Sella, and POUNCE eigenvector following — on one
 shared system so you can compare them.
+
+[`examples/alloys/`](examples/alloys/) builds up to alloy design: the elastic
+stiffness tensor (`start_elastic_scan`), the formation-energy convex hull
+(`start_convex_hull`), and a design loop that gates candidates on stability then
+ranks the survivors by a mechanical property.
 
 ## Safety
 

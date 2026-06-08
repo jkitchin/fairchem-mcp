@@ -71,7 +71,8 @@ def attach_lammps(
     energy/forces, ASE drives the dynamics.
 
     Works with every steerable job (start_md, start_relaxation, start_neb,
-    start_phonons, start_eos_scan, start_minima_search). pair_style/pair_coeff are
+    start_phonons, start_eos_scan, start_elastic_scan, start_convex_hull,
+    start_minima_search). pair_style/pair_coeff are
     raw LAMMPS commands minus the keyword, e.g. pair_style="lj/cut 7.0",
     pair_coeff="1 1 0.4 2.34"; or pair_style="eam/alloy",
     pair_coeff="* * Cu_u3.eam.alloy Cu". atom_types maps symbols to LAMMPS type
@@ -226,6 +227,73 @@ def start_eos_scan(
             SESSION, structure_id, calculator_id,
             n_points=n_points, strain_range=strain_range, relax_ions=relax_ions,
             optimizer=optimizer, fmax=fmax, steps=steps, step_delay=step_delay,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def start_elastic_scan(
+    structure_id: str,
+    calculator_id: str,
+    n_strains: int = 5,
+    max_strain: float = 0.01,
+    relax_ions: bool = False,
+    optimizer: str = "FIRE",
+    fmax: float = 0.05,
+    steps: int = 200,
+    step_delay: float = 0.0,
+) -> dict:
+    """Measure the elastic stiffness tensor by stress-vs-strain (background job).
+
+    The anisotropic analog of an EOS: strains the cell by n_strains magnitudes in
+    ±max_strain along each of the 6 Voigt directions, reads the stress, and fits
+    C_ij = dσ_i/dε_j. get_results returns the 6x6 C_GPa, Voigt-Reuss-Hill
+    bulk/shear/Young's moduli, Poisson and Pugh ratios, and a Born mechanical-
+    stability verdict. Use relax_ions for the clamped-ion correction (slower).
+    Needs a 3-D periodic crystal, ideally pre-relaxed at its equilibrium cell.
+    Poll get_status for done/total; abort/pause act between deformations.
+    """
+    try:
+        return domain.start_elastic_scan(
+            SESSION, structure_id, calculator_id,
+            n_strains=n_strains, max_strain=max_strain, relax_ions=relax_ions,
+            optimizer=optimizer, fmax=fmax, steps=steps, step_delay=step_delay,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _err(exc)
+
+
+@mcp.tool()
+def start_convex_hull(
+    structure_ids: list,
+    calculator_id: str,
+    relax: bool = False,
+    relax_cell: bool = False,
+    references: dict | None = None,
+    labels: list | None = None,
+    optimizer: str = "FIRE",
+    fmax: float = 0.05,
+    steps: int = 200,
+    step_delay: float = 0.0,
+) -> dict:
+    """Build the formation-energy convex hull over a set of compositions (job).
+
+    Pass structure_ids spanning a chemical system (pure elements + candidate
+    compounds/alloys). Each is evaluated (optionally relaxed; relax_cell also
+    relaxes the cell), formation energies per atom are referenced to the pure
+    elements, and the lower convex hull is built. get_results reports per phase the
+    formation_energy_per_atom, energy_above_hull_per_atom (0 = stable), on_hull
+    flag, and the list of stable_phases. Pure elements must be among the inputs or
+    given as references={element: energy_per_atom}. Works for any element count.
+    Poll get_status for done/total; abort/pause act between structures.
+    """
+    try:
+        return domain.start_convex_hull(
+            SESSION, structure_ids, calculator_id,
+            relax=relax, relax_cell=relax_cell, references=references,
+            labels=labels, optimizer=optimizer, fmax=fmax, steps=steps,
+            step_delay=step_delay,
         )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)

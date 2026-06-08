@@ -458,6 +458,111 @@ def start_eos_scan(
     return {"job_id": job.id, "kind": "eos", "config": config}
 
 
+def start_elastic_scan(
+    session: Session,
+    structure_id: str,
+    calculator_id: str,
+    n_strains: int = 5,
+    max_strain: float = 0.01,
+    relax_ions: bool = False,
+    optimizer: str = "FIRE",
+    fmax: float = 0.05,
+    steps: int = 200,
+    step_delay: float = 0.0,
+) -> dict:
+    """Measure the elastic stiffness tensor (the anisotropic analog of an EOS).
+
+    Strains the cell by ``n_strains`` magnitudes within ``±max_strain`` along each
+    of the 6 Voigt directions, reads the resulting stress, and least-squares fits
+    C_ij = dσ_i/dε_j. Reports the full 6x6 stiffness matrix (GPa), Voigt-Reuss-Hill
+    bulk/shear/Young's moduli, Poisson and Pugh (G/K) ratios, and a Born
+    mechanical-stability verdict (C positive-definite). With ``relax_ions`` the
+    internal coordinates relax at each fixed strained cell (the proper clamped-ion
+    correction; slower). Needs a 3-D periodic crystal — ideally already relaxed at
+    its equilibrium cell, since elastic constants are defined about the minimum.
+    Steerable via abort/pause between deformations; poll get_status for done/total.
+    """
+    template = session.get_structure(structure_id).copy()
+    template.calc = None
+    base = session.get_calculator(calculator_id)
+
+    config = {
+        "n_strains": n_strains,
+        "max_strain": max_strain,
+        "relax_ions": relax_ions,
+        "optimizer": optimizer,
+        "fmax": fmax,
+        "steps": steps,
+        "step_delay": step_delay,
+    }
+    job = Job(session._new_id("job"), None, "elastic", config)
+    job.template = template
+    job.base_calc = base
+    job.session = session
+    JobManager(session).start_prepared(job)
+    return {"job_id": job.id, "kind": "elastic", "config": config}
+
+
+def start_convex_hull(
+    session: Session,
+    structure_ids: list,
+    calculator_id: str,
+    relax: bool = False,
+    relax_cell: bool = False,
+    references: dict | None = None,
+    labels: list | None = None,
+    optimizer: str = "FIRE",
+    fmax: float = 0.05,
+    steps: int = 200,
+    step_delay: float = 0.0,
+) -> dict:
+    """Build the formation-energy convex hull (phase stability) over compositions.
+
+    Give a list of ``structure_ids`` spanning a chemical system — the pure
+    elements plus candidate compounds/alloys. Each is evaluated (optionally
+    relaxing ions, and the cell when ``relax_cell``), then formation energies per
+    atom are referenced to the pure elements and the lower convex hull is built.
+    Results report, per phase, the formation energy, distance above the hull
+    (``energy_above_hull_per_atom``, 0 = stable), and an ``on_hull`` flag, plus the
+    list of ``stable_phases``.
+
+    The pure elements must appear among the inputs, or be supplied as
+    ``references={element: energy_per_atom}`` (eV/atom). ``labels`` optionally names
+    each entry (defaults to the chemical formula). Works for any number of
+    elements. Steerable via abort/pause between structures; poll get_status for
+    done/total. This is the objective an alloy-design loop screens against.
+    """
+    atoms_list = []
+    used_labels = []
+    for k, sid in enumerate(structure_ids):
+        a = session.get_structure(sid).copy()
+        a.calc = None
+        atoms_list.append(a)
+        if labels is not None and k < len(labels):
+            used_labels.append(str(labels[k]))
+        else:
+            used_labels.append(a.get_chemical_formula())
+
+    base = session.get_calculator(calculator_id)
+    config = {
+        "relax": relax,
+        "relax_cell": relax_cell,
+        "references": references,
+        "optimizer": optimizer,
+        "fmax": fmax,
+        "steps": steps,
+        "step_delay": step_delay,
+    }
+    job = Job(session._new_id("job"), None, "hull", config)
+    job.hull_atoms = atoms_list
+    job.hull_labels = used_labels
+    job.base_calc = base
+    job.session = session
+    JobManager(session).start_prepared(job)
+    return {"job_id": job.id, "kind": "hull", "config": config,
+            "n_structures": len(atoms_list)}
+
+
 def start_saddle_search(
     session: Session,
     structure_id: str,

@@ -17,6 +17,7 @@ dependencies = [
     "ase>=3.22",
     "jedi>=0.19",
     "numpy",
+    "scipy",
 ]
 
 [project.optional-dependencies]

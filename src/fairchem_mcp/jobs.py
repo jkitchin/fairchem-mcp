@@ -61,8 +61,8 @@ class Job:
 
     def __init__(self, job_id: str, atoms: Any, kind: str, config: dict):
         self.id = job_id
-        self.atoms = atoms  # single structure (relax/md); None for neb/phonon/minima/eos
-        self.kind = kind  # "relax" | "md" | "neb" | "phonon" | "minima" | "eos"
+        self.atoms = atoms  # single structure (relax/md); None for multi-structure jobs
+        self.kind = kind  # relax|md|neb|phonon|minima|eos|elastic|hull|dimer|sella|saddles
         self.config = dict(config)
 
         # Populated by the NEB / phonon / dimer runners.
@@ -77,6 +77,8 @@ class Job:
         self.template: Any = None  # starting Atoms (positions = x0), no calc
         self.base_calc: Any = None  # the true-PES calculator to bias/polish on
         self.session: Any = None  # to register each found minimum as a structure
+        self.hull_atoms: list[Any] | None = None  # convex-hull composition set
+        self.hull_labels: list[str] | None = None  # one label per hull structure
 
         self.status = "pending"
         self.step = 0
@@ -98,6 +100,8 @@ class Job:
             "phonon": _run_phonon,
             "minima": _run_minima,
             "eos": _run_eos,
+            "elastic": _run_elastic,
+            "hull": _run_hull,
             "dimer": _run_dimer,
             "sella": _run_sella,
             "saddles": _run_saddles,
@@ -883,6 +887,341 @@ def _run_eos(job: Job) -> None:
             time.sleep(step_delay)
 
     _finalize_eos(job, "finished", volumes, energies)
+
+
+# ---------------------------------------------------------------------------
+# Elastic constants (the anisotropic analog of the EOS: stress vs. strain).
+# Apply small strains along each of the 6 Voigt directions, read the resulting
+# stress, and fit C_ij = dσ_i/dε_j. Voigt-Reuss-Hill averaging then gives the
+# polycrystalline bulk/shear/Young's moduli plus a Born mechanical-stability check
+# — the inputs an alloy-design loop optimizes against.
+# ---------------------------------------------------------------------------
+
+# 1 eV/Å³ in GPa (ase.units.GPa is 1 GPa expressed in eV/Å³; divide to convert).
+def _voigt_strain_matrix(e: "np.ndarray") -> "np.ndarray":
+    """3x3 symmetric strain tensor from a 6-vector in Voigt order (xx,yy,zz,yz,xz,xy)."""
+    return np.array([
+        [e[0], e[5] / 2.0, e[4] / 2.0],
+        [e[5] / 2.0, e[1], e[3] / 2.0],
+        [e[4] / 2.0, e[3] / 2.0, e[2]],
+    ])
+
+
+def _elastic_moduli(C: "np.ndarray") -> dict:
+    """Voigt-Reuss-Hill moduli (GPa) and derived quantities from a 6x6 C (GPa)."""
+    out: dict = {}
+    c = C
+    # Voigt averages (uniform-strain bound).
+    K_v = ((c[0, 0] + c[1, 1] + c[2, 2]) + 2 * (c[0, 1] + c[0, 2] + c[1, 2])) / 9.0
+    G_v = (
+        (c[0, 0] + c[1, 1] + c[2, 2]) - (c[0, 1] + c[0, 2] + c[1, 2])
+        + 3 * (c[3, 3] + c[4, 4] + c[5, 5])
+    ) / 15.0
+    out["bulk_modulus_voigt_GPa"] = round(float(K_v), 3)
+    out["shear_modulus_voigt_GPa"] = round(float(G_v), 3)
+    try:
+        S = np.linalg.inv(c)  # compliance
+        K_r = 1.0 / ((S[0, 0] + S[1, 1] + S[2, 2]) + 2 * (S[0, 1] + S[0, 2] + S[1, 2]))
+        G_r = 15.0 / (
+            4 * (S[0, 0] + S[1, 1] + S[2, 2]) - 4 * (S[0, 1] + S[0, 2] + S[1, 2])
+            + 3 * (S[3, 3] + S[4, 4] + S[5, 5])
+        )
+        K_h, G_h = 0.5 * (K_v + K_r), 0.5 * (G_v + G_r)
+        out["bulk_modulus_reuss_GPa"] = round(float(K_r), 3)
+        out["shear_modulus_reuss_GPa"] = round(float(G_r), 3)
+        out["bulk_modulus_GPa"] = round(float(K_h), 3)   # Hill (the usual headline)
+        out["shear_modulus_GPa"] = round(float(G_h), 3)
+        if 3 * K_h + G_h > 0:
+            out["youngs_modulus_GPa"] = round(float(9 * K_h * G_h / (3 * K_h + G_h)), 3)
+            out["poisson_ratio"] = round(float((3 * K_h - 2 * G_h) / (2 * (3 * K_h + G_h))), 4)
+        if K_h != 0:
+            out["pugh_ratio_G_over_K"] = round(float(G_h / K_h), 4)  # <0.57 ~ ductile
+    except np.linalg.LinAlgError:
+        out["fit_error"] = "stiffness matrix is singular (not invertible)"
+    # Born stability: a stable crystal has a positive-definite C.
+    eig = np.linalg.eigvalsh(c)
+    out["C_eigenvalues_GPa"] = [round(float(x), 3) for x in eig]
+    out["mechanically_stable"] = bool((eig > 0).all())
+    return out
+
+
+def _finalize_elastic(job: Job, status: str, C_gpa: "np.ndarray | None") -> None:
+    result: dict = {}
+    if C_gpa is not None:
+        result["C_GPa"] = [[round(float(C_gpa[i, j]), 3) for j in range(6)] for i in range(6)]
+        result.update(_elastic_moduli(C_gpa))
+    job.result = result
+    with job._lock:
+        job.status = status
+
+
+def _run_elastic(job: Job) -> None:
+    """Measure the elastic stiffness tensor by straining the cell and reading stress.
+
+    For each of the 6 Voigt strain directions, applies ``n_strains`` magnitudes in
+    ``±max_strain`` (relaxing the ions at fixed strained cell when ``relax_ions``),
+    records the stress, and least-squares fits C_ij = dσ_i/dε_j. Reports the full
+    6x6 C (GPa), Voigt-Reuss-Hill bulk/shear/Young's moduli, Poisson and Pugh
+    ratios, and a Born mechanical-stability verdict. ``abort``/``pause`` act between
+    deformations. Needs a 3-D periodic crystal.
+    """
+    from ase.units import GPa
+
+    cfg = job.config
+    template = job.template
+    base = job.base_calc
+    n_strains = int(cfg.get("n_strains", 5))
+    max_strain = float(cfg.get("max_strain", 0.01))
+    relax_ions = bool(cfg.get("relax_ions", False))
+    optimizer_name = cfg.get("optimizer", "FIRE")
+    fmax = float(cfg.get("fmax", 0.05))
+    max_steps = int(cfg.get("steps", 200))
+    step_delay = float(cfg.get("step_delay", 0.0))
+
+    cell0 = np.asarray(template.get_cell(), dtype=float)
+    if not all(bool(p) for p in template.pbc) or abs(float(np.linalg.det(cell0))) < 1e-8:
+        raise ValueError(
+            "elastic-constant scan needs a 3-D periodic cell; this structure is "
+            "not periodic in all directions (build a bulk crystal)"
+        )
+    if n_strains < 3:
+        raise ValueError("n_strains must be >= 3 to fit a stress-strain slope")
+
+    grid = np.linspace(-max_strain, max_strain, n_strains)
+    eye = np.eye(3)
+    total = 6 * n_strains
+
+    with job._lock:
+        job.status = "running"
+
+    # stresses[j] -> list of (strain_magnitude, stress_voigt_6) for direction j.
+    stresses: list[list[tuple]] = [[] for _ in range(6)]
+    done = 0
+    for j in range(6):
+        for m in grid:
+            for cmd in job._drain_controls():
+                if cmd.kind == "abort":
+                    _finalize_elastic(job, "aborted", None)
+                    return
+                if cmd.kind == "pause" and job._wait_while_paused():
+                    _finalize_elastic(job, "aborted", None)
+                    return
+
+            e = np.zeros(6)
+            e[j] = float(m)
+            work = template.copy()
+            work.set_cell(cell0 @ (eye + _voigt_strain_matrix(e)), scale_atoms=True)
+            work.calc = base
+            if relax_ions:
+                opt = make_optimizer(optimizer_name, work)
+                for _ in opt.irun(fmax=fmax, steps=max_steps):
+                    pass
+            sigma = np.asarray(work.get_stress(voigt=True), dtype=float)  # eV/Å³
+            stresses[j].append((float(m), sigma))
+
+            done += 1
+            job.step = done
+            job.record_fields(done=done, total=total, fraction=done / total)
+            if step_delay:
+                time.sleep(step_delay)
+
+    # Fit C_ij = dσ_i/dε_j (column j from straining direction j), then -> GPa.
+    C = np.zeros((6, 6))
+    for j in range(6):
+        ms = np.array([p[0] for p in stresses[j]])
+        sig = np.array([p[1] for p in stresses[j]])  # (n_strains, 6)
+        for i in range(6):
+            slope = np.polyfit(ms, sig[:, i], 1)[0]
+            C[i, j] = slope
+    C = 0.5 * (C + C.T) / GPa  # symmetrize and convert eV/Å³ -> GPa
+    _finalize_elastic(job, "finished", C)
+
+
+# ---------------------------------------------------------------------------
+# Convex hull of formation energies (phase stability for alloys).
+# Given the energies of several compositions plus pure-element references, the
+# formation energy per atom is E_f = (E - Σ n_i μ_i)/N. The lower convex hull of
+# E_f vs. composition is the set of thermodynamically stable phases; a phase's
+# distance above that hull (energy_above_hull) is how metastable it is. The hull
+# math is a pure function of (composition, energy) so it can be unit-tested with
+# synthetic energies; the job runner just supplies energies from the calculator.
+# ---------------------------------------------------------------------------
+
+def _counts(atoms: Any) -> dict:
+    """Element -> atom count for a structure."""
+    out: dict = {}
+    for s in atoms.get_chemical_symbols():
+        out[s] = out.get(s, 0) + 1
+    return out
+
+
+def _derive_references(entries: list, overrides: dict | None) -> dict:
+    """Reference μ per element: per-atom energy of the lowest pure-element entry.
+
+    ``overrides`` (element -> μ in eV/atom) wins over any pure entry found among
+    the inputs. Raises ValueError if an element that appears in a mixed entry has
+    no pure reference and no override.
+    """
+    refs: dict = {}
+    for e in entries:
+        counts = e["counts"]
+        if len(counts) == 1:  # a pure-element entry
+            (sym, n), = counts.items()
+            mu = e["energy"] / n
+            if sym not in refs or mu < refs[sym]:
+                refs[sym] = mu
+    if overrides:
+        refs.update({k: float(v) for k, v in overrides.items()})
+    needed = {s for e in entries for s in e["counts"]}
+    missing = sorted(needed - set(refs))
+    if missing:
+        raise ValueError(
+            "no reference energy for element(s) "
+            f"{missing}: include a pure-element structure for each, or pass "
+            "references={element: energy_per_atom}"
+        )
+    return refs
+
+
+def _energy_above_hull(comps: "np.ndarray", form: "np.ndarray", tol: float = 1e-4) -> tuple:
+    """Distance of each point above the lower convex hull of formation energies.
+
+    ``comps`` is (m, d) composition fractions (rows sum to 1), ``form`` is the
+    length-m formation energy per atom. For each point the hull energy is the
+    lowest formation energy reachable as a convex combination of all points at the
+    same composition — a small linear program — so it works for any number of
+    elements. Returns (energy_above_hull[m], on_hull_bool[m]).
+    """
+    from scipy.optimize import linprog
+
+    m = len(form)
+    A_eq = np.vstack([comps.T, np.ones(m)])  # composition rows + (Σλ = 1)
+    above = np.zeros(m)
+    for j in range(m):
+        b_eq = np.append(comps[j], 1.0)
+        res = linprog(form, A_eq=A_eq, b_eq=b_eq, bounds=(0, None), method="highs")
+        hull_e = float(res.fun) if res.success else float(form[j])
+        above[j] = max(0.0, float(form[j]) - hull_e)
+    on_hull = above <= tol
+    return above, on_hull
+
+
+def _hull_from_entries(entries: list, overrides: dict | None = None) -> dict:
+    """Formation energies + convex-hull stability for a set of composition entries.
+
+    ``entries`` is a list of ``{"label": str, "counts": {sym: n}, "energy": eV}``.
+    Pure backbone of the convex-hull tool — no ASE/calculator dependency, so it is
+    unit-testable with hand-written energies.
+    """
+    refs = _derive_references(entries, overrides)
+    elements = sorted({s for e in entries for s in e["counts"]})
+    m = len(entries)
+    comps = np.zeros((m, len(elements)))
+    form = np.zeros(m)
+    for j, e in enumerate(entries):
+        counts = e["counts"]
+        n = sum(counts.values())
+        for i, sym in enumerate(elements):
+            comps[j, i] = counts.get(sym, 0) / n
+        form[j] = (e["energy"] - sum(counts.get(s, 0) * refs[s] for s in elements)) / n
+    above, on_hull = _energy_above_hull(comps, form)
+
+    phases = []
+    for j, e in enumerate(entries):
+        phases.append({
+            "label": e["label"],
+            "composition": {elements[i]: round(float(comps[j, i]), 4)
+                            for i in range(len(elements)) if comps[j, i] > 0},
+            "n_atoms": sum(e["counts"].values()),
+            "energy": round(float(e["energy"]), 6),
+            "formation_energy_per_atom": round(float(form[j]), 6),
+            "energy_above_hull_per_atom": round(float(above[j]), 6),
+            "on_hull": bool(on_hull[j]),
+        })
+    return {
+        "elements": elements,
+        "references_eV_per_atom": {k: round(float(v), 6) for k, v in refs.items()},
+        "phases": phases,
+        "stable_phases": [p["label"] for p in phases if p["on_hull"]],
+    }
+
+
+def _run_hull(job: Job) -> None:
+    """Evaluate several compositions and build their formation-energy convex hull.
+
+    For each input structure (optionally relaxing ions, and the cell when
+    ``relax_cell``) the total energy is computed, then formation energies per atom
+    are referenced to the pure elements and the lower convex hull is built. Pure
+    elements must be present among the inputs or supplied via ``references``.
+    ``abort``/``pause`` act between structures. The classic alloy phase-stability
+    picture and the objective an alloy-design loop screens against.
+    """
+    from ase.filters import FrechetCellFilter
+
+    cfg = job.config
+    structures = job.hull_atoms
+    labels = job.hull_labels
+    base = job.base_calc
+    relax = bool(cfg.get("relax", False))
+    relax_cell = bool(cfg.get("relax_cell", False))
+    optimizer_name = cfg.get("optimizer", "FIRE")
+    fmax = float(cfg.get("fmax", 0.05))
+    max_steps = int(cfg.get("steps", 200))
+    step_delay = float(cfg.get("step_delay", 0.0))
+    overrides = cfg.get("references")
+
+    with job._lock:
+        job.status = "running"
+
+    entries: list = []
+    total = len(structures)
+    for i, (atoms0, label) in enumerate(zip(structures, labels)):
+        for cmd in job._drain_controls():
+            if cmd.kind == "abort":
+                _finalize_hull(job, "aborted", None)
+                return
+            if cmd.kind == "pause" and job._wait_while_paused():
+                _finalize_hull(job, "aborted", None)
+                return
+
+        work = atoms0.copy()
+        work.calc = base
+        if relax:
+            target = FrechetCellFilter(work) if relax_cell else work
+            opt = make_optimizer(optimizer_name, target)
+            for _ in opt.irun(fmax=fmax, steps=max_steps):
+                pass
+        energy = float(work.get_potential_energy())
+        entries.append({"label": label, "counts": _counts(work), "energy": energy})
+
+        job.step = i + 1
+        job.record_fields(
+            energy=energy, done=i + 1, total=total, fraction=(i + 1) / total,
+        )
+        if step_delay:
+            time.sleep(step_delay)
+
+    _finalize_hull(job, "finished", entries, overrides)
+
+
+def _finalize_hull(job: Job, status: str, entries: list | None,
+                   overrides: dict | None = None) -> None:
+    result: dict = {}
+    if entries:
+        try:
+            result = _hull_from_entries(entries, overrides)
+        except ValueError as exc:
+            # All energies are in hand but the references are incomplete: keep them
+            # for the user and fail clearly rather than silently dropping the run.
+            job.result = {"energies": [{"label": e["label"], "energy": e["energy"]}
+                                       for e in entries]}
+            with job._lock:
+                job.status = "failed"
+                job.error = str(exc)
+            return
+    job.result = result
+    with job._lock:
+        job.status = status
 
 
 # ---------------------------------------------------------------------------
