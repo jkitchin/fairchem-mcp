@@ -1,4 +1,4 @@
-"""The FastMCP server: registers all tools and resources over stdio.
+"""The MCP server (mcp 2.x MCPServer): registers all tools and resources over stdio.
 
 All logging goes to stderr — the stdio transport reserves stdout for the MCP
 protocol, so any stray print to stdout would corrupt the stream.
@@ -11,7 +11,7 @@ import logging
 import sys
 import traceback
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from . import domain, introspect as introspect_mod
 from .jobs import JobManager
@@ -20,7 +20,7 @@ from .session import Session
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 log = logging.getLogger("fairchem-mcp")
 
-mcp = FastMCP("fairchem-mcp")
+mcp = MCPServer("fairchem-mcp")
 SESSION = Session()
 
 
@@ -416,18 +416,31 @@ def start_phonons(
     supercell: list[int] | None = None,
     delta: float = 0.05,
     step_delay: float = 0.0,
+    band_path: str | None = None,
+    band_points: int = 100,
+    dos_grid: int = 24,
 ) -> dict:
     """Start a phonon (finite-displacement) calculation in the background.
 
     Runs 1 + 6*natoms force evaluations; poll get_status for progress (done/total,
     fraction). When done, get_results returns gamma-point frequencies (THz), the
-    count of imaginary modes, and a 'stable' flag. supercell defaults to [2,2,2].
+    count of imaginary modes, a 'stable' flag, a full phonon 'dispersion' sampled
+    along a Brillouin-zone k-path, and a phonon 'dos' (density of states). Both
+    reuse the force constants already computed (no extra force evaluations). The
+    dispersion path is chosen automatically from the cell's Bravais lattice (e.g.
+    Γ-X-W-K-Γ-L for fcc) when band_path is None; pass a path string like "GXWLG"
+    to override and band_points to set sampling density. The DOS is built on a
+    dos_grid^3 q-mesh (dos_grid=0 skips it). supercell defaults to [2,2,2]. The
+    dispersion block carries distances, per-branch frequencies_THz, and
+    high_symmetry_points (tick distances + labels); the dos block carries
+    frequencies_THz and dos weights -- both ready to plot.
     """
     try:
         return domain.start_phonons(
             SESSION, structure_id, calculator_id,
             supercell=tuple(supercell) if supercell else (2, 2, 2),
             delta=delta, step_delay=step_delay,
+            band_path=band_path, band_points=band_points, dos_grid=dos_grid,
         )
     except Exception as exc:  # noqa: BLE001
         return _err(exc)
@@ -504,8 +517,9 @@ def get_trajectory(job_id: str, last_n: int = 20) -> dict:
 @mcp.tool()
 def get_results(job_id: str) -> dict:
     """Return a job's final results, if any: NEB barrier/energies, phonon gamma
-    frequencies and stability, distinct minima, or EOS V0/E0/bulk_modulus_GPa.
-    None until the job finishes."""
+    frequencies + stability + dispersion along a k-path + density of states,
+    distinct minima, or EOS V0/E0/bulk_modulus_GPa. None until the job
+    finishes."""
     try:
         return {"job_id": job_id, "result": SESSION.get_job(job_id).result}
     except Exception as exc:  # noqa: BLE001

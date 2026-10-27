@@ -13,7 +13,7 @@ license = { text = "MIT" }
 keywords = ["fairchem", "ase", "mcp", "simulation", "materials", "chemistry"]
 
 dependencies = [
-    "mcp>=1.0",
+    "mcp>=2.0",
     "ase>=3.22",
     "jedi>=0.19",
     "numpy",

@@ -522,23 +522,97 @@ def _run_phonon(job: Job) -> None:
                 if step_delay:
                     time.sleep(step_delay)
 
-    job.result = _phonon_results(ph)
+    job.result = _phonon_results(ph, job.config)
     with job._lock:
         job.status = "finished"
 
 
-def _phonon_results(ph: Any) -> dict:
+def _phonon_results(ph: Any, config: dict | None = None) -> dict:
+    config = config or {}
     ph.read(acoustic=True)
     omega = np.asarray(ph.band_structure([[0, 0, 0]])[0], dtype=float)  # eV
     freqs_thz = omega * _EV_TO_THZ
     tol = 1e-3  # eV; modes below -tol are imaginary (unstable)
     n_imag = int((omega < -tol).sum())
-    return {
+    result = {
         "gamma_frequencies_THz": [round(float(f), 4) for f in freqs_thz],
         "n_imaginary_modes": n_imag,
         "min_frequency_THz": round(float(freqs_thz.min()), 4),
         "stable": bool(n_imag == 0),
         "supercell": list(ph.supercell),
+    }
+    dispersion = _phonon_dispersion(
+        ph,
+        band_path=config.get("band_path"),
+        npoints=int(config.get("band_points", 100) or 100),
+    )
+    if dispersion is not None:
+        result["dispersion"] = dispersion
+    dos = _phonon_dos(ph, grid=int(config.get("dos_grid", 24) or 0))
+    if dos is not None:
+        result["dos"] = dos
+    return result
+
+
+def _phonon_dispersion(ph: Any, band_path: str | None, npoints: int) -> dict | None:
+    """Evaluate the stored force constants along a Brillouin-zone k-path.
+
+    No extra force evaluations: the finite-displacement run already produced the
+    full force constants, so a dispersion is just those constants Fourier-summed
+    along a path. The path is chosen automatically from the cell's Bravais lattice
+    (ASE's Setyawan-Curtarolo special points) when ``band_path`` is None, so the
+    caller gets a sensible traverse (e.g. Γ-X-W-K-Γ-L for fcc) without naming one;
+    pass a string like "GXWLG" to override. Returns per-branch frequencies in THz
+    plus the high-symmetry tick positions/labels needed to plot a dispersion, or
+    None if the cell has no recognizable band path.
+    """
+    try:
+        path = ph.atoms.cell.bandpath(band_path, npoints=npoints)
+    except Exception:  # noqa: BLE001 -- unrecognized lattice -> no dispersion
+        return None
+    # eV -> THz; verbose=False silences ASE's per-q imaginary-mode warnings.
+    omega_e = np.asarray(ph.band_structure(path.kpts, verbose=False), dtype=float)
+    freqs_thz = omega_e * _EV_TO_THZ
+    xcoords, special_x, labels = path.get_linear_kpoint_axis()
+    labels = ["Γ" if lbl in ("G", "GAMMA", "\\Gamma", "Gamma") else lbl
+              for lbl in labels]
+    return {
+        "path": path.path,
+        "n_kpoints": int(freqs_thz.shape[0]),
+        "n_bands": int(freqs_thz.shape[1]),
+        "distances": [round(float(x), 5) for x in xcoords],
+        "frequencies_THz": [[round(float(f), 4) for f in row] for row in freqs_thz],
+        "high_symmetry_points": {
+            "distances": [round(float(x), 5) for x in special_x],
+            "labels": list(labels),
+        },
+        "max_frequency_THz": round(float(freqs_thz.max()), 4),
+    }
+
+
+def _phonon_dos(ph: Any, grid: int, npts: int = 200) -> dict | None:
+    """Phonon density of states from the same force constants.
+
+    Diagonalizes the dynamical matrix on a regular grid x grid x grid q-mesh and
+    bins the frequencies into a smoothed DOS -- no extra force evaluations. The
+    weights are reported per THz per cell, so integrating over the frequency axis
+    recovers the 3*natoms branches. Returns None if grid <= 0 or the sampling
+    fails.
+    """
+    if grid <= 0:
+        return None
+    try:
+        # ~7e-2 THz Gaussian smearing (3e-4 eV) gives a smooth-but-resolved DOS.
+        dos = ph.get_dos(kpts=(grid, grid, grid)).sample_grid(npts=npts, width=3e-4)
+    except Exception:  # noqa: BLE001 -- DOS is best-effort; never block results
+        return None
+    energies_thz = np.asarray(dos.get_energies(), dtype=float) * _EV_TO_THZ
+    weights_per_thz = np.asarray(dos.get_weights(), dtype=float) / _EV_TO_THZ
+    return {
+        "frequencies_THz": [round(float(e), 4) for e in energies_thz],
+        "dos": [round(float(w), 6) for w in weights_per_thz],
+        "grid": [grid, grid, grid],
+        "n_points": int(energies_thz.shape[0]),
     }
 
 

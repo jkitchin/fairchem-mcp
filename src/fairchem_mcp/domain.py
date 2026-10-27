@@ -784,13 +784,22 @@ def start_phonons(
     supercell: list | tuple = (2, 2, 2),
     delta: float = 0.05,
     step_delay: float = 0.0,
+    band_path: str | None = None,
+    band_points: int = 100,
+    dos_grid: int = 24,
 ) -> dict:
     """Build and launch a phonon (finite-displacement) calculation.
 
     Runs 1 + 6*natoms force evaluations in the background, reporting progress.
     On completion, reports gamma-point frequencies and any imaginary (unstable)
-    modes. The Phonons object is bound as 'ph' in the namespace for band
-    structure / DOS via the execute escape hatch.
+    modes, plus a full phonon dispersion sampled along a Brillouin-zone k-path and
+    a phonon density of states. The path defaults to the standard special-point
+    traverse for the cell's Bravais lattice (ASE Setyawan-Curtarolo) when
+    band_path is None; pass a string like "GXWLG" to override, and band_points to
+    set the sampling density. The DOS is built on a dos_grid^3 q-mesh (set
+    dos_grid=0 to skip it). Both reuse the force constants already computed -- no
+    extra force evaluations. The Phonons object is bound as 'ph' in the namespace
+    for further work via the execute escape hatch.
     """
     import os
     import tempfile
@@ -811,6 +820,9 @@ def start_phonons(
         "step_delay": step_delay,
         "cache_dir": cache_dir,
         "n_displacements": 1 + 6 * len(ph.indices),
+        "band_path": band_path,
+        "band_points": band_points,
+        "dos_grid": dos_grid,
     }
     job = Job(session._new_id("job"), None, "phonon", config)
     job.ph = ph

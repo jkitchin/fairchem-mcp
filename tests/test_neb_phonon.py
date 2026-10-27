@@ -85,6 +85,49 @@ def test_phonon_completes_and_reports_stability():
     assert len(result["gamma_frequencies_THz"]) == 3
     assert result["n_imaginary_modes"] == 0
 
+    # A full dispersion is reported along an auto-chosen k-path (no band_path
+    # given), reusing the force constants already computed.
+    disp = result["dispersion"]
+    assert disp["n_bands"] == 3
+    assert disp["n_kpoints"] == 100  # default band_points
+    assert len(disp["frequencies_THz"]) == disp["n_kpoints"]
+    assert all(len(row) == disp["n_bands"] for row in disp["frequencies_THz"])
+    assert len(disp["distances"]) == disp["n_kpoints"]
+    # fcc path begins at Gamma; labels are mapped to the Greek glyph.
+    labels = disp["high_symmetry_points"]["labels"]
+    assert labels[0] == "Γ"
+    assert "X" in labels
+    assert len(disp["high_symmetry_points"]["distances"]) == len(labels)
+    assert disp["max_frequency_THz"] > 0.0
+
+    # A phonon DOS is reported on a q-grid from the same force constants.
+    dos = result["dos"]
+    assert dos["grid"] == [24, 24, 24]  # default dos_grid
+    assert len(dos["frequencies_THz"]) == dos["n_points"]
+    assert len(dos["dos"]) == dos["n_points"]
+    assert max(dos["dos"]) > 0.0
+    # DOS spans roughly the same frequency window as the dispersion.
+    assert max(dos["frequencies_THz"]) >= disp["max_frequency_THz"] - 1.0
+
+
+def test_phonon_dispersion_honors_explicit_band_path():
+    session = Session()
+    cid = domain.attach_emt(session)["calculator_id"]
+    sid = domain.build_structure(
+        session, {"kind": "bulk", "name": "Cu", "crystalstructure": "fcc", "a": 3.6}
+    )["structure_id"]
+
+    res = domain.start_phonons(
+        session, sid, cid, supercell=(2, 2, 2),
+        band_path="GXL", band_points=60,
+    )
+    job = session.get_job(res["job_id"])
+    assert wait_for(lambda: not job.is_active(), timeout=60)
+
+    disp = job.result["dispersion"]
+    assert disp["n_kpoints"] == 60
+    assert disp["high_symmetry_points"]["labels"] == ["Γ", "X", "L"]
+
 
 def test_phonon_abort():
     session = Session()

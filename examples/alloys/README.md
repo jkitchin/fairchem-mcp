@@ -54,3 +54,28 @@ potential, not the relaxation), so its real intermetallics wrongly look unstable
 For quantitative alloy energetics use `asap3`'s alloy-parameterized EMT, or — for
 any system — point these scripts at a UMA model. The *workflow* is identical; only
 the energies get trustworthy.
+
+## Live demo / recording
+
+[`alloy_demo.py`](alloy_demo.py) weaves the three steps into one paced, narrated
+driver (real engine, colored output) — the same calls the MCP tools wrap. Press
+ENTER between beats, or auto-advance for a hands-free run:
+
+```bash
+python examples/alloys/alloy_demo.py                 # presenting live (ENTER between beats)
+DEMO_AUTO=1 python examples/alloys/alloy_demo.py     # auto-advance (DEMO_SPEED scales pauses)
+```
+
+A committed [asciinema](https://asciinema.org) cast is in
+[`recordings/alloy_design.cast`](recordings/) — play it as a fallback (re-record in
+your own terminal for the polished version):
+
+```bash
+asciinema play examples/alloys/recordings/alloy_design.cast            # SPACE pauses
+asciinema play --speed 0.5 examples/alloys/recordings/alloy_design.cast # slower, to narrate
+
+# Re-record (auto-advancing, roomy pacing):
+DEMO_AUTO=1 DEMO_SPEED=1.3 asciinema rec examples/alloys/recordings/alloy_design.cast \
+  --overwrite --title "fairchem-mcp alloy design" \
+  --command "python examples/alloys/alloy_demo.py"
+```
