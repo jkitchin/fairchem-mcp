@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "fairchem": {
+      "description": "Agent-steerable FAIRChem/ASE simulations: resident model, background relaxations/MD/NEB/phonons, live monitoring and mid-flight steering. Core install (EMT, ASE); see the README to add the fairchem, lammps or saddles extras.",
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/jkitchin/fairchem-mcp", "fairchem-mcp"]
+    }
+  }
+}

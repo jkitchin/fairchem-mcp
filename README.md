@@ -77,7 +77,28 @@ and [`pounce-solver`](https://pypi.org/project/pounce-solver/) (multistart
 eigenvector following). The **dimer** method (`start_saddle_search`) is pure ASE
 and needs neither. See [`examples/saddles/`](examples/saddles/) for all three.
 
-## Register with Claude Code
+## Install with knowhow
+
+This repo is a [knowhow](https://github.com/jkitchin/knowhow) source. It provides
+the `fairchem` MCP server (`mcp/fairchem.json`) and a `fairchem-mcp` skill
+(`skills/fairchem-mcp/`), which teaches the agent how to use the tools: the
+start/poll/steer loop, how to respond to each trend label, and which job to use for
+which question. One command installs both, with no clone needed:
+
+```bash
+uvx knowhow add jkitchin/fairchem-mcp --skill fairchem-mcp --mcp fairchem
+# add -g for all projects, -a vscode / -a cursor / -a codex for other agents
+```
+
+The server is launched with `uvx --from git+https://github.com/jkitchin/fairchem-mcp
+fairchem-mcp`, which is the core install (EMT and ASE). To load UMA models, edit the
+installed config so the `--from` argument is
+`fairchem-mcp[fairchem] @ git+https://github.com/jkitchin/fairchem-mcp` (likewise
+`[lammps]` or `[saddles]`). The first launch downloads PyTorch, so run that `uvx`
+command once in a terminal before starting the agent. Otherwise the MCP startup
+can time out.
+
+## Register with Claude Code manually
 
 Add to your MCP config (see `examples/claude_mcp_config.json`):
 

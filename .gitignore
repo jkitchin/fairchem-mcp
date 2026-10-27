@@ -30,3 +30,6 @@ htmlcov/
 *.log
 phonon*.json
 fairchem_mcp_phonon_*/
+
+# Claude Code per-user settings
+.claude/settings.local.json
